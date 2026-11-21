@@ -16,8 +16,8 @@
  *   整页一个 form.Map：
  *     - 状态        : NamedSection + Flag / DummyValue（LAN 作用域、警告）
  *     - 单独设备    : GridSection（扫描选设备 -> 自动填 IP/MAC/名称）
- *     - 批量限速    : GridSection（扫描选 IP 区间 / 自定义 / 起始 IP+掩码生成）
- *                   每行下面注入「不限速名单」展开区（group-exclude-*）
+ *     - 批量限速    : GridSection（起始 IP / 结束 IP / 扫描候选）
+ *                   每条规则的白名单在编辑弹窗里维护（group-exclude-*）
  *     - 默认限速    : NamedSection（不再手填 CIDR/白名单，作用范围自动跟随 LAN）
  *   页脚原生「保存 / 保存并应用 / 复位」：Map.save() -> uci.apply() ->
  *   hlimit-ctl apply（offload-apply + render）-> 刷新页面。
@@ -28,7 +28,7 @@
  *   - 批量规则按 IP 区间（start - end）匹配，后端用 iptables iprange；
  *     scan.candidates 的值形如 10.0.1.0-10.0.1.255；每 group 的 exclude 列表用
  *     group-exclude-add/del；
- *   - 设备名称显示 label -> 主机名 -> IP 回退；0/0 明确显示「不限速」。
+ *   - 设备名称显示 label -> 主机名 -> IP/MAC 回退（不再拼接状态文字）。
  *
  * 仅使用固件里已核实的稳定 API：
  *   form.Map / NamedSection / GridSection / Flag / Value / DummyValue /
@@ -1763,10 +1763,6 @@ function buildGroupSection(m) {
 
 
 /* ------------------------------------------------------------------ */
-/* 批量「不限速名单」行（渲染后注入到每个 group 行下方）              */
-/* ------------------------------------------------------------------ */
-
-/* ------------------------------------------------------------------ */
 /* 白名单：放在批量规则的编辑弹窗里（modalonly）                       */
 /* ------------------------------------------------------------------ */
 
@@ -2150,8 +2146,8 @@ return view.extend({
 
 		/*
 		 * Map 的任意重绘（保存/删除行/弹窗保存后的 load+reset）都会走
-		 * renderContents()；在这里统一重新应用表格布局与「不限速名单」注入，
-		 * 避免 GridSection 重绘后样式和展开区丢失。
+		 * renderContents()；在这里统一重新应用表格布局，避免 GridSection
+		 * 重绘后固定列宽样式丢失。
 		 */
 		if (typeof m.renderContents == 'function') {
 			var origRenderContents = m.renderContents;
@@ -2177,8 +2173,7 @@ return view.extend({
 	},
 
 	/*
-	 * 覆写 handleSave：Map.save() 会重绘表格，注入的「不限速名单」行会丢失，
-	 * 因此保存后重新应用布局并重新注入。
+	 * 覆写 handleSave：Map.save() 会重绘表格，保存后重新应用表格布局。
 	 */
 	handleSave: function(ev) {
 		var save = mapObject

@@ -169,7 +169,8 @@ ok(src.indexOf('poll.add') >= 0 && src.indexOf('poll.remove') >= 0,
 
 contains(src, 'addremove = true', '设备/批量表格支持增删');
 contains(src, 'modalonly = true', '扫描/生成等辅助控件只在弹窗出现');
-contains(src, 'decorateTables', '批量行下注入不限速名单');
+notContains(src, 'decorateTables', '不再向批量表行注入白名单行');
+contains(src, 'GroupExcludeValue', '白名单是弹窗内的 DummyValue 控件');
 contains(src, 'tableLayout', '表格 table-layout:fixed');
 contains(src, 'overflowX', '窄屏横向滚动兜底');
 
@@ -180,8 +181,8 @@ notContains(src, "'192.168.2.0/24'", '源码没有硬编码 192.168.2.0/24 作�
 notContains(src, "'10.0.0.0/8'", '源码没有硬编码 10.0.0.0/8 作用域');
 
 /* placeholder 必须同时给出 10.x 与 192.168.x 两类示例 */
-[ '10.0.0.50', '192.168.2.50', '10.0.0.128/25', '192.168.2.96/28',
-  '10.0.0.110', '192.168.2.110' ].forEach(function(example) {
+[ '10.0.0.50', '192.168.2.50', '10.0.1.1 - 10.0.2.1',
+  '192.168.2.10 - 192.168.2.99', '10.0.0.110' ].forEach(function(example) {
 	contains(src, example, '输入提示包含示例 ' + example);
 });
 
@@ -233,6 +234,15 @@ function FakeNode(tag) {
 	};
 }
 
+Object.defineProperty(FakeNode.prototype, 'innerHTML', {
+	get: function() { return this._html || ''; },
+	set: function(v) {
+		this._html = String(v);
+		this.children = [];
+		this.textContent = '';
+	}
+});
+
 Object.defineProperty(FakeNode.prototype, 'nextSibling', {
 	get: function() {
 		if (!this.parentNode)
@@ -242,6 +252,10 @@ Object.defineProperty(FakeNode.prototype, 'nextSibling', {
 			? this.parentNode.children[i + 1] : null;
 	}
 });
+
+FakeNode.prototype.focus = function() {};
+FakeNode.prototype.blur = function() {};
+FakeNode.prototype.select = function() {};
 
 FakeNode.prototype.setAttribute = function(key, value) {
 	var v = String(value);
@@ -779,6 +793,11 @@ function defaultUciData() {
 				mac: '11:22:33:44:55:66', label: '只填MAC',
 				enabled: '1', down_kbps: '2000', up_kbps: '0'
 			},
+			'dev_mac_nolabel': {
+				'.name': 'dev_mac_nolabel', '.type': 'device', '.index': 10,
+				mac: '22:33:44:55:66:77', label: '', enabled: '1',
+				down_kbps: '0', up_kbps: '0'
+			},
 			'dev_stale': {
 				'.name': 'dev_stale', '.type': 'device', '.index': 4,
 				ip: '192.168.2.162', label: '旧设备',
@@ -786,13 +805,15 @@ function defaultUciData() {
 			},
 			'grp_guest': {
 				'.name': 'grp_guest', '.type': 'group', '.index': 5,
-				cidr: '10.0.0.128/25', label: '访客网段',
+				start: '10.0.0.128', end: '10.0.0.255', range: '10.0.0.128-10.0.0.255',
+				label: '访客网段',
 				enabled: '1', down_kbps: '10000', up_kbps: '2000',
 				exclude: [ '10.0.0.190', 'AA:BB:CC:DD:EE:FF' ]
 			},
 			'grp_old': {
 				'.name': 'grp_old', '.type': 'group', '.index': 6,
-				cidr: '192.168.5.0/24', label: '旧批量',
+				start: '192.168.5.0', end: '192.168.5.255', range: '192.168.5.0-192.168.5.255',
+				label: '旧批量',
 				enabled: '1', down_kbps: '1000', up_kbps: '1000',
 				exclude: []
 			}
@@ -863,10 +884,10 @@ var SCAN_10X = {
 		{ ip: '10.148.198.136', mac: '0A:7B:56:35:AE:9C', name: '', source: 'arp', online: '1' }
 	],
 	candidates: [
-		{ cidr: '10.0.0.0/8', first: '10.0.0.0', last: '10.255.255.255',
-		  hosts: '3', label: '全部局域网 10.0.0.0/8' },
-		{ cidr: '10.0.0.0/24', first: '10.0.0.0', last: '10.0.0.255',
-		  hosts: '3', label: '10.0.0.0/24（3 台在线）' }
+		{ range: '10.0.0.0-10.255.255.255', start: '10.0.0.0', end: '10.255.255.255',
+		  hosts: '', label: '全部局域网 10.0.0.0 – 10.255.255.255' },
+		{ range: '10.0.0.0-10.0.0.255', start: '10.0.0.0', end: '10.0.0.255',
+		  hosts: '3', label: '10.0.0.0 – 10.0.0.255（3 台在线）' }
 	]
 };
 
@@ -882,26 +903,33 @@ var STATUS_10X = {
 		{ kind: 'device', ip: '', mac: '11:22:33:44:55:66', resolved_ip: '10.0.0.180',
 		  down_unresolved: '0', label: '只填MAC', enabled: '1',
 		  down_kbps: '2000', up_kbps: '0', down_bytes: 0, up_bytes: 0 },
+		{ kind: 'device', ip: '', mac: '22:33:44:55:66:77', resolved_ip: '',
+		  down_unresolved: '1', label: '', enabled: '1',
+		  down_kbps: '0', up_kbps: '0', down_bytes: 0, up_bytes: 0 },
 		{ kind: 'device', ip: '', mac: '77:88:99:AA:BB:CC', resolved_ip: '',
 		  down_unresolved: '1', label: '未解析', enabled: '1',
 		  down_kbps: '1000', up_kbps: '500', down_bytes: 0, up_bytes: 0 },
 		{ kind: 'device', ip: '192.168.2.162', mac: '', resolved_ip: '192.168.2.162',
 		  down_unresolved: '0', label: '旧设备', enabled: '1',
 		  down_kbps: '1000', up_kbps: '1000', down_bytes: 0, up_bytes: 0 },
-		{ kind: 'group', cidr: '10.0.0.128/25', label: '访客网段', enabled: '1',
+		{ kind: 'group', cidr: '', range: '10.0.0.128-10.0.0.255',
+		  start: '10.0.0.128', end: '10.0.0.255', label: '访客网段', enabled: '1',
 		  down_kbps: '10000', up_kbps: '2000',
 		  exclude: [ '10.0.0.190', 'AA:BB:CC:DD:EE:FF' ],
 		  down_bytes: 1000, up_bytes: 500 },
-		{ kind: 'group', cidr: '192.168.5.0/24', label: '旧批量', enabled: '1',
+		{ kind: 'group', cidr: '', range: '192.168.5.0-192.168.5.255',
+		  start: '192.168.5.0', end: '192.168.5.255', label: '旧批量', enabled: '1',
 		  down_kbps: '1000', up_kbps: '1000', exclude: [], down_bytes: 0, up_bytes: 0 },
 		{ kind: 'default', cidr: '10.0.0.0/8', label: '默认限速', enabled: '1',
 		  down_kbps: '5000', up_kbps: '1000', down_bytes: 10, up_bytes: 20 }
 	],
 	groups: [
-		{ kind: 'group', cidr: '10.0.0.128/25', label: '访客网段', enabled: '1',
+		{ kind: 'group', cidr: '', range: '10.0.0.128-10.0.0.255',
+		  start: '10.0.0.128', end: '10.0.0.255', label: '访客网段', enabled: '1',
 		  down_kbps: '10000', up_kbps: '2000',
 		  exclude: [ '10.0.0.190', 'AA:BB:CC:DD:EE:FF' ], down_bytes: 1000, up_bytes: 500 },
-		{ kind: 'group', cidr: '192.168.5.0/24', label: '旧批量', enabled: '1',
+		{ kind: 'group', cidr: '', range: '192.168.5.0-192.168.5.255',
+		  start: '192.168.5.0', end: '192.168.5.255', label: '旧批量', enabled: '1',
 		  down_kbps: '1000', up_kbps: '1000', exclude: [], down_bytes: 0, up_bytes: 0 }
 	],
 	defaults: {
@@ -922,8 +950,8 @@ var SCAN_192 = {
 		{ ip: '10.0.0.99', mac: 'AA:BB:CC:DD:EE:99', name: '', source: 'arp', online: '1' }
 	],
 	candidates: [
-		{ cidr: '192.168.2.0/24', first: '192.168.2.0', last: '192.168.2.255',
-		  hosts: '2', label: '全部局域网 192.168.2.0/24' }
+		{ range: '192.168.2.0-192.168.2.255', start: '192.168.2.0', end: '192.168.2.255',
+		  hosts: '2', label: '全部局域网 192.168.2.0 – 192.168.2.255' }
 	]
 };
 
@@ -933,17 +961,21 @@ var STATUS_192 = {
 		{ kind: 'device', ip: '192.168.2.50', mac: 'AA:BB:CC:DD:EE:50', resolved_ip: '192.168.2.50',
 		  down_unresolved: '0', label: '客厅电视', enabled: '1',
 		  down_kbps: '20000', up_kbps: '5000', down_bytes: 0, up_bytes: 0 },
-		{ kind: 'group', cidr: '192.168.2.128/25', label: '访客', enabled: '1',
+		{ kind: 'group', cidr: '', range: '192.168.2.128-192.168.2.255',
+		  start: '192.168.2.128', end: '192.168.2.255', label: '访客', enabled: '1',
 		  down_kbps: '10000', up_kbps: '2000', exclude: [], down_bytes: 0, up_bytes: 0 },
-		{ kind: 'group', cidr: '10.0.0.0/8', label: '老网段', enabled: '1',
+		{ kind: 'group', cidr: '', range: '10.0.0.0-10.255.255.255',
+		  start: '10.0.0.0', end: '10.255.255.255', label: '老网段', enabled: '1',
 		  down_kbps: '1000', up_kbps: '1000', exclude: [], down_bytes: 0, up_bytes: 0 },
 		{ kind: 'default', cidr: '192.168.2.0/24', label: '默认限速', enabled: '0',
 		  down_kbps: '0', up_kbps: '0', down_bytes: 0, up_bytes: 0 }
 	],
 	groups: [
-		{ kind: 'group', cidr: '192.168.2.128/25', label: '访客', enabled: '1',
+		{ kind: 'group', cidr: '', range: '192.168.2.128-192.168.2.255',
+		  start: '192.168.2.128', end: '192.168.2.255', label: '访客', enabled: '1',
 		  down_kbps: '10000', up_kbps: '2000', exclude: [], down_bytes: 0, up_bytes: 0 },
-		{ kind: 'group', cidr: '10.0.0.0/8', label: '老网段', enabled: '1',
+		{ kind: 'group', cidr: '', range: '10.0.0.0-10.255.255.255',
+		  start: '10.0.0.0', end: '10.255.255.255', label: '老网段', enabled: '1',
 		  down_kbps: '1000', up_kbps: '1000', exclude: [], down_bytes: 0, up_bytes: 0 }
 	],
 	defaults: {
@@ -1162,7 +1194,7 @@ function run() {
 		contains(oWarn.cfgvalue(), '示例告警', '告警显示后端 warnings');
 		contains(oWarn.cfgvalue(), 'stale', '告警提示 stale 设备');
 		contains(oWarn.cfgvalue(), '未解析', '告警提示 down_unresolved');
-		contains(oWarn.cfgvalue(), '192.168.5.0/24', '告警提示不在 LAN 的批量规则');
+		contains(oWarn.cfgvalue(), '192.168.5.0', '告警提示不在 LAN 的批量规则');
 
 		/* --- 4.4 默认限速：无 CIDR/白名单输入，有只读范围 --- */
 		var def = sectionByTitle('默认限速');
@@ -1201,20 +1233,20 @@ function run() {
 		         '名称列显示 label');
 		contains(collectText(oName.textvalue('dev_empty_label')), '10.0.0.124',
 		         '名称列 label 空 -> 无主机名 -> 回退 IP');
-		contains(collectText(oName.textvalue('dev_empty_label')), '不限速',
-		         '名称列对 0/0 设备显示「不限速」');
-		contains(collectText(oName.textvalue('dev_mac_only')), '→ 10.0.0.180',
-		         '名称列 MAC-only 显示解析出的当前 IP');
-		ok(collectText(oName.textvalue('dev_mac_only')).indexOf('未解析') < 0,
-		   '已解析设备不显示未解析');
+		ok(collectText(oName.textvalue('dev_empty_label')).indexOf('不限速') < 0,
+		   '名称列不再拼接「不限速」（1.3 起移除）');
+		contains(collectText(oName.textvalue('dev_mac_nolabel')), '22:33:44:55:66:77',
+		         '名称列无 label 时回退显示 MAC');
+		ok(collectText(oName.textvalue('dev_mac_nolabel')).indexOf('→') < 0,
+		   '名称列不再显示解析出的当前 IP（1.3 起移除）');
 		var unresolvedDev = {
 			'.name': 'dev_unresolved', '.type': 'device', '.index': 9,
 			mac: '77:88:99:AA:BB:CC', label: '未解析', enabled: '1',
 			down_kbps: '1000', up_kbps: '500'
 		};
 		uciData['hashlimit-qos']['dev_unresolved'] = unresolvedDev;
-		contains(collectText(oName.textvalue('dev_unresolved')), '未解析',
-		         '名称列 down_unresolved 显示未解析');
+		ok(collectText(oName.textvalue('dev_mac_nolabel')).indexOf('未解析') < 0,
+		   '名称列不再显示未解析状态（1.3 起移除）');
 		contains(oIp.placeholder, '10.0.0.50', 'IP placeholder 含 10.x 示例');
 		contains(oIp.placeholder, '192.168.2.50', 'IP placeholder 含 192.168.x 示例');
 		ok(!!oIp.choices && oIp.choices.some(function(c) { return c.key === '10.0.0.162'; }),
@@ -1231,116 +1263,117 @@ function run() {
 		ok(macWidget.getValue() === 'AA:BB:CC:DD:EE:01', '选择设备后自动填 MAC');
 		ok(labelWidget.getValue() === '客厅电视', '选择设备后自动填名称');
 
-		/* --- 4.6 批量表格 --- */
+		/* --- 4.6 批量表格：区间列 + 弹窗字段 --- */
 		var grp = sectionByTitle('批量限速');
 		var titlesG = grp.children.filter(function(o) { return o.modalonly !== true; })
 			.map(function(o) { return o.title; });
-		ok(titlesG.join(',') === '启用,CIDR / 区间,名称,下行(Mbps),上行(Mbps)',
-		   '批量表头：启用/CIDR/名称/下行/上行');
-		var oCidr = optionByName(grp, 'cidr');
-		var oCidrInfo = optionByName(grp, '_cidr');
-		ok(oCidr.modalonly === true, 'CIDR 输入只在新增/编辑弹窗');
-		contains(oCidr.placeholder, '10.0.0.128/25', 'CIDR placeholder 含 10.x 示例');
-		contains(oCidr.placeholder, '192.168.2.96/28', 'CIDR placeholder 含 192.168.x 示例');
-		contains(collectText(oCidrInfo.textvalue('grp_guest')), '10.0.0.128 – 10.0.0.255',
-		         '批量 CIDR 显示区间');
-		contains(collectText(oCidrInfo.textvalue('grp_guest')), '128 个地址',
-		         '批量 CIDR 显示地址数');
-		contains(collectText(oCidrInfo.textvalue('grp_old')), '不在当前 LAN',
+		ok(titlesG.join(',') === '启用,IP 区间,名称,下行(Mbps),上行(Mbps)',
+		   '批量表头：启用/IP 区间/名称/下行/上行');
+
+		var oStart = optionByName(grp, 'start');
+		var oEnd = optionByName(grp, 'end');
+		ok(oStart.modalonly === true, '起始 IP 只在新增/编辑弹窗');
+		ok(oEnd.modalonly === true, '结束 IP 只在新增/编辑弹窗');
+		contains(oStart.placeholder, '10.0.0.100', '起始 IP placeholder 含示例');
+		contains(oEnd.placeholder, '10.0.0.200', '结束 IP placeholder 含示例');
+
+		var rangeCell = optionByName(grp, '_range');
+		ok(rangeCell.modalonly === false, '表格 IP 区间列只读');
+		contains(collectText(rangeCell.textvalue('grp_guest')), '10.0.0.128 – 10.0.0.255',
+		         '批量表格显示起止 IP');
+		contains(collectText(rangeCell.textvalue('grp_guest')), '128 个地址',
+		         '批量表格显示地址数');
+		contains(collectText(rangeCell.textvalue('grp_old')), '不在当前 LAN',
 		         '不属于 LAN 的批量规则标红提示');
 
-		/* 扫描候选 / 起始 IP 生成 / 区间信息 */
-		var scanSel = optionByName(grp, '_scan_cidr');
+		/* 弹窗顶部：扫描候选 + 区间信息 */
+		var scanSel = optionByName(grp, '_scan_range');
 		ok(scanSel.modalonly === true, '扫描候选下拉只在弹窗');
 		var scanNode = scanSel.renderWidget('grp_guest');
-		contains(collectText(scanNode), '10.0.0.0 – 10.255.255.255（3 台在线）',
-		         '扫描候选显示 cidr + 首尾 + 在线数');
-		var pickNode = picker.renderWidget('dev_stale');
-		contains(collectText(pickNode), '客厅电视（10.0.0.162）',
-		         '设备选择下拉显示名称（IP）');
-		var cidrWidget = oCidr.getUIElement('grp_guest');
-		var infoEl = new FakeNode('div');
-		infoEl.setAttribute('id', 'hlimit-group-info-grp_guest');
-		infoEl.style = {};
-		scanSel.applyCidr('grp_guest', '10.0.0.0/8');
-		ok(cidrWidget.getValue() === '10.0.0.0/8', '选择扫描候选后填入 CIDR');
-		contains(infoEl.textContent, '10.0.0.0 – 10.255.255.255',
-		         '选择候选后实时显示区间');
+		contains(collectText(scanNode), '10.0.0.0 – 10.0.0.255', '扫描候选显示区间');
+		contains(collectText(scanNode), '3 台在线', '扫描候选显示在线台数');
 
-		var startGen = optionByName(grp, '_start_cidr');
-		startGen.generate('grp_guest', '10.0.0.100', '28');
-		ok(cidrWidget.getValue() === '10.0.0.96/28', '起始 IP + /28 生成 10.0.0.96/28');
-		startGen.generate('grp_guest', '10.0.0.100', '24');
-		ok(cidrWidget.getValue() === '10.0.0.0/24', '起始 IP + /24 生成 10.0.0.0/24');
-		var notifBefore = notifications.length;
-		startGen.generate('grp_guest', '999.1.1.1', '28');
-		ok(notifications.length === notifBefore + 1 && hasNotification('起始 IP 不合法'),
-		   '起始 IP 非法时提示且不写入');
-
-		var infoOpt = optionByName(grp, '_cidr_info');
+		var infoOpt = optionByName(grp, '_range_info');
+		ok(infoOpt.modalonly === true, '区间 / 作用域只在弹窗');
 		contains(infoOpt.cfgvalue('grp_guest'), '10.0.0.128 – 10.0.0.255',
-		         'modal 区间信息默认显示当前 CIDR 区间');
+		         '弹窗区间信息显示当前区间');
+		contains(infoOpt.cfgvalue('grp_guest'), '扫描到 1 台在线主机',
+		         '弹窗区间信息显示扫描到的在线主机');
 		contains(infoOpt.cfgvalue('grp_old'), '不在当前 LAN',
-		         'modal 区间信息提示不在 LAN');
+		         '弹窗区间信息提示不在 LAN');
 
-		/* --- 4.7 每行「不限速名单」 --- */
-		var rows = injectedRows();
-		ok(rows.length === 2, '每个批量规则行下注入 1 个不限速名单行');
-		contains(collectText(rows[0]), '不限速名单（2）', '不限速名单显示数量 N');
-		contains(collectText(rows[0]), '10.0.0.190', '白名单 chip 显示 IP');
-		contains(collectText(rows[0]), 'AA:BB:CC:DD:EE:FF', '白名单 chip 显示 MAC');
+		scanSel.applyRange('grp_guest', '10.0.0.0-10.255.255.255');
+		ok(oStart.getUIElement('grp_guest').getValue() === '10.0.0.0',
+		   '选择扫描候选后填入起始 IP');
+		ok(oEnd.getUIElement('grp_guest').getValue() === '10.255.255.255',
+		   '选择扫描候选后填入结束 IP');
 
-		/* 该 CIDR 内主机下拉应排除已加入的 */
-		var select = rows[0].querySelector('#hlimit-exclude-host-grp_guest');
-		ok(!!select, '不限速名单含主机下拉');
-		contains(collectText(select), '10.0.0.162', '主机下拉含该网段内主机');
-		ok(collectText(select).indexOf('10.0.0.107') < 0, '主机下拉不含网段外主机');
+		contains(collectText(picker.renderWidget('dev_stale')), '客厅电视（10.0.0.162）',
+		         '设备选择下拉显示名称（IP）');
 
-		/* 添加自定义 IP -> group-exclude-add */
+		/* --- 4.7 白名单在编辑弹窗里 --- */
+		ok(injectedRows().length === 0, '批量表格里不再注入白名单行');
+
+		var oExcl = optionByName(grp, '_exclude');
+		ok(oExcl.modalonly === true, '白名单只在编辑弹窗里');
+		ok(oExcl.title === '白名单', '白名单标题为「白名单」');
+
+		var box = oExcl.renderWidget('grp_guest');
+		contains(collectText(box), '10.0.0.190', '白名单 chip 显示 IP');
+		contains(collectText(box), 'AA:BB:CC:DD:EE:FF', '白名单 chip 显示 MAC');
+		contains(collectText(box), '白名单仅对当前区间生效', '白名单提示生效范围');
+
+		var custom = box.querySelector('#hlimit-exclude-custom-grp_guest');
+		var addBtn = box.querySelector('.cbi-button-add');
+		ok(!!custom, '白名单区含输入框');
+		ok(!!addBtn && collectText(addBtn).trim() === '+', '白名单区含 + 按钮');
+
+		/* 非法值 / 区间外 / 重复值：前端拦截，不调后端 */
 		ctlCalls.length = 0;
-		var custom = rows[0].querySelector('#hlimit-exclude-custom-grp_guest');
+		custom.value = '999.1.1.1';
+		addBtn.dispatchEvent({ type: 'click' });
+		ok(!findCall('group-exclude-add'), '非法 IP 不调用后端');
+		ok(hasNotification('格式或范围不正确', 'danger'), '非法 IP 给出可读提示');
+
+		custom.value = '10.0.0.50';
+		ctlCalls.length = 0;
+		addBtn.dispatchEvent({ type: 'click' });
+		ok(!findCall('group-exclude-add'), '不在区间内的 IP 不调用后端');
+		ok(hasNotification('格式或范围不正确', 'danger'), '区间外 IP 给出可读提示');
+
+		custom.value = '10.0.0.190';
+		ctlCalls.length = 0;
+		addBtn.dispatchEvent({ type: 'click' });
+		ok(!findCall('group-exclude-add'), '重复 IP 不调用后端');
+		ok(hasNotification('无需添加', 'warning'), '重复 IP 给出「无需添加」提示');
+
+		/* 合法添加 -> group-exclude-add <range> <ip> */
+		ctlCalls.length = 0;
 		custom.value = '10.0.0.170';
-		var addBtn = rows[0].querySelector('.cbi-button-add');
 		addBtn.dispatchEvent({ type: 'click' });
 
 		return wait().then(function() {
 			var call = findCall('group-exclude-add');
-			ok(!!call && call.params[1] === '10.0.0.128/25' && call.params[2] === '10.0.0.170',
-			   '添加白名单调用 group-exclude-add <cidr> <ip>');
-			ok(hasNotification('已加入不限速名单', 'success'), '添加白名单成功提示');
+			ok(!!call && call.params[1] === '10.0.0.128-10.0.0.255' &&
+			   call.params[2] === '10.0.0.170',
+			   '添加白名单调用 group-exclude-add <range> <ip>');
+			ok(hasNotification('已加入白名单', 'success'), '添加白名单成功提示');
 
 			/* 删除 chip -> group-exclude-del */
+			var freshBox = oExcl.renderWidget('grp_guest');
 			ctlCalls.length = 0;
-			var delBtn = rows[0].querySelector('.cbi-button-remove');
+			var delBtn = freshBox.querySelector('.cbi-button-remove');
+			ok(!!delBtn, '白名单 chip 含删除按钮');
 			delBtn.dispatchEvent({ type: 'click' });
+
 			return wait().then(function() {
 				var delCall = findCall('group-exclude-del');
 				ok(!!delCall, '删除白名单调用 group-exclude-del');
+				ok(delCall && delCall.params[1] === '10.0.0.128-10.0.0.255',
+				   'group-exclude-del 使用当前区间');
 				ok(delCall && (delCall.params[2] === '10.0.0.190' ||
 				   delCall.params[2] === 'AA:BB:CC:DD:EE:FF'),
 				   'group-exclude-del 参数为被删条目');
-
-				/* 非法格式 / 不在 CIDR 内 -> 本地拦截，不调后端 */
-				var fresh = injectedRows()[0];
-
-				if (!fresh) {
-					ok(false, '重新注入不限速名单行');
-					return Promise.resolve();
-				}
-
-				var custom2 = fresh.querySelector('#hlimit-exclude-custom-grp_guest');
-				var add2 = fresh.querySelector('.cbi-button-add');
-				ctlCalls.length = 0;
-				custom2.value = '999.1.1.1';
-				add2.dispatchEvent({ type: 'click' });
-				ok(!findCall('group-exclude-add'), '非法 IP/MAC 不调用后端');
-				ok(hasNotification('格式不正确', 'danger'), '非法 IP/MAC 给出可读提示');
-
-				custom2.value = '10.0.0.50';
-				ctlCalls.length = 0;
-				add2.dispatchEvent({ type: 'click' });
-				ok(!findCall('group-exclude-add'), '不在 CIDR 内的 IP 不调用后端');
-				ok(hasNotification('不在该网段内', 'danger'), '不在 CIDR 内给出可读提示');
 			});
 		});
 	}).then(function() {
@@ -1381,15 +1414,10 @@ function run() {
 			});
 		});
 	}).then(function() {
-		/* --- 4.9 Map 重绘后重新注入不限速名单 --- */
-		injectedRows().forEach(function(tr) {
-			if (tr.parentNode)
-				tr.parentNode.removeChild(tr);
-		});
-		ok(injectedRows().length === 0, '模拟 Map 重绘清掉注入行');
-
+		/* --- 4.9 保存（Map 重绘）后仍然没有注入行 --- */
 		return Promise.resolve(impl.handleSave({})).then(function() {
-			ok(injectedRows().length === 2, '保存（Map 重绘）后重新注入不限速名单行');
+			ok(injectedRows().length === 0, '保存重绘后没有任何注入的白名单行');
+			ok(tables().length === 2, '仍只有单独设备与批量限速两张表');
 		});
 	}).then(function() {
 		/* --- poll --- */
@@ -1436,12 +1464,16 @@ function run() {
 				},
 				'grp_192': {
 					'.name': 'grp_192', '.type': 'group', '.index': 2,
-					cidr: '192.168.2.128/25', label: '访客', enabled: '1',
+					start: '192.168.2.128', end: '192.168.2.255',
+					range: '192.168.2.128-192.168.2.255',
+					label: '访客', enabled: '1',
 					down_kbps: '10000', up_kbps: '2000'
 				},
 				'grp_old': {
 					'.name': 'grp_old', '.type': 'group', '.index': 3,
-					cidr: '10.0.0.0/8', label: '老网段', enabled: '1',
+					start: '10.0.0.0', end: '10.255.255.255',
+					range: '10.0.0.0-10.255.255.255',
+					label: '老网段', enabled: '1',
 					down_kbps: '1000', up_kbps: '1000'
 				}
 			}
@@ -1472,7 +1504,7 @@ function run() {
 			ok(lanText.indexOf('10.0.0.1') < 0, '192.168 夹具不显示 10.x 网关');
 
 			var warn = optionByName(status, 'hlimit_warnings').cfgvalue();
-			contains(warn, '10.0.0.0/8', '192.168 夹具：10.0.0.0/8 批量规则被判不在 LAN');
+			contains(warn, '10.0.0.0', '192.168 夹具：10.0.0.0/8 批量规则被判不在 LAN');
 			ok(warn.indexOf('192.168.2.50') < 0, '192.168 夹具：LAN 内设备不报 stale');
 
 			var dev = sectionByTitle('单独设备');
@@ -1484,9 +1516,9 @@ function run() {
 
 			/* 批量 CIDR 区间显示 192.168.x */
 			var grp = sectionByTitle('批量限速');
-			contains(collectText(optionByName(grp, '_cidr').textvalue('grp_192')),
+			contains(collectText(optionByName(grp, '_range').textvalue('grp_192')),
 			         '192.168.2.128 – 192.168.2.255',
-			         '192.168 夹具：CIDR 区间按 192.168.x 计算');
+			         '192.168 夹具：批量区间按 192.168.x 显示');
 		});
 	}).then(function() {
 		/* --- 4.11 scan 不可用 -> 回退 devices --- */
@@ -1536,7 +1568,8 @@ function run() {
 		resetUci();
 		uciData['hashlimit-qos']['grp_new'] = {
 			'.name': 'grp_new', '.type': 'group', '.index': 7,
-			cidr: '10.0.0.0/28', label: '未应用网段', enabled: '1',
+			start: '10.0.0.0', end: '10.0.0.15', range: '10.0.0.0-10.0.0.15',
+			label: '未应用网段', enabled: '1',
 			down_kbps: '5000', up_kbps: '1000', exclude: []
 		};
 		ctlResponder = defaultResponder;
@@ -1544,25 +1577,16 @@ function run() {
 		var implNew = loadView();
 
 		return renderWith(implNew).then(function() {
-			var rows = injectedRows();
-			var newRow = null;
+			var grpNew = sectionByTitle('批量限速');
+			var newBox = optionByName(grpNew, '_exclude').renderWidget('grp_new');
 
-			rows.forEach(function(tr) {
-				if (collectText(tr).indexOf('未应用网段') >= 0 ||
-				    collectText(tr).indexOf('10.0.0.0/28') >= 0)
-					newRow = tr;
-			});
-
-			if (!newRow) {
-				/* 行本身没有标签，按注入顺序找到第三个（grp_new 在最后） */
-				newRow = rows[rows.length - 1];
-			}
-
-			ok(!!newRow, '未应用的批量规则也注入不限速名单行');
-			contains(collectText(newRow), '尚未保存并应用',
+			ok(!!newBox, '未应用的批量规则也能渲染白名单区');
+			contains(collectText(newBox), '尚未保存并应用',
 			         '未应用的规则提示先保存并应用');
-			ok(!!newRow && !newRow.querySelector('.cbi-button-add'),
-			   '未应用的规则不显示添加控件');
+			ok(!newBox.querySelector('.cbi-button-add'),
+			   '未应用的规则不显示 + 按钮');
+			ok(!newBox.querySelector('#hlimit-exclude-custom-grp_new'),
+			   '未应用的规则不显示输入框');
 		});
 	}).then(function() {
 		/* --- 4.14 非法 JSON --- */

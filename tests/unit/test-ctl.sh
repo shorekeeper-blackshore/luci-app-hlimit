@@ -31,6 +31,8 @@ E=$TMPBASE
 RC=0
 OUT=
 ERR=
+HLIMIT_VER=$(sed -n 's/^VERSION=//p' "$CTL" | head -n 1)
+export HLIMIT_VER
 
 pass() { PASS=$((PASS + 1)); }
 fail() { FAIL=$((FAIL + 1)); printf 'FAIL [%s] %s\n' "$CURRENT_SHELL" "$*"; }
@@ -194,22 +196,25 @@ dev_add_mac() { # mac down up [enabled] [label] [ip]
 	} >>"$UCI_STUB_STATE"
 }
 
-grp_add() { # cidr down up [enabled] [label] [exclude...]
-	_cidr=$1
-	_dn=$2
-	_up=$3
-	_en=${4:-1}
-	_lbl=${5:-}
-	_sec=grp_$(printf '%s' "$_cidr" | tr './' '__')
+grp_add() { # start end down up [enabled] [label] [exclude...]
+	_start=$1
+	_end=$2
+	_dn=$3
+	_up=$4
+	_en=${5:-1}
+	_lbl=${6:-}
+	_sec=grp_$(printf '%s_%s' "$_start" "$_end" | tr './' '__')
 	{
 		printf 'hashlimit-qos.%s=group\n' "$_sec"
-		printf 'hashlimit-qos.%s.cidr=%s\n' "$_sec" "$_cidr"
+		printf 'hashlimit-qos.%s.start=%s\n' "$_sec" "$_start"
+		printf 'hashlimit-qos.%s.end=%s\n' "$_sec" "$_end"
+		printf 'hashlimit-qos.%s.range=%s-%s\n' "$_sec" "$_start" "$_end"
 		printf 'hashlimit-qos.%s.label=%s\n' "$_sec" "$_lbl"
 		printf 'hashlimit-qos.%s.enabled=%s\n' "$_sec" "$_en"
 		printf 'hashlimit-qos.%s.down_kbps=%s\n' "$_sec" "$_dn"
 		printf 'hashlimit-qos.%s.up_kbps=%s\n' "$_sec" "$_up"
 	} >>"$UCI_STUB_STATE"
-	shift 5 2>/dev/null || return 0
+	shift 6 2>/dev/null || return 0
 	for _ex in "$@"; do
 		printf 'hashlimit-qos.%s.exclude=%s\n' "$_sec" "$_ex" >>"$UCI_STUB_STATE"
 	done
@@ -372,13 +377,13 @@ test_render_multi_lan() {
 	uci_put "hashlimit-qos.defaults.default_down_kbps=2000"
 	uci_put "hashlimit-qos.defaults.default_up_kbps=500"
 	dev_add 10.0.1.50 5000 1000 1 'guest-client'
-	grp_add 10.0.1.96/28 10000 2000 1 'guest-group'
+	grp_add 10.0.1.96 10.0.1.111 10000 2000 1 'guest-group'
 	ctl render
 	assert_rc "render multi LAN" 0
 	assert_contains "guest device on br-guest" \
 		"-A HLIMIT_UP -i br-guest -s 10.0.1.50 -m hashlimit" "$(ipt_log)"
 	assert_contains "guest group on br-guest" \
-		"-A HLIMIT_DOWN -o br-guest -d 10.0.1.96/28 -m hashlimit" "$(ipt_log)"
+		"-A HLIMIT_DOWN -o br-guest -m iprange --dst-range 10.0.1.96-10.0.1.111 -m hashlimit" "$(ipt_log)"
 	assert_contains "default on br-lan" \
 		"-A HLIMIT_UP -i br-lan -m hashlimit --hashlimit-name hl_up_def_br_lan" "$(ipt_log)"
 	assert_contains "default on br-guest" \
@@ -432,7 +437,7 @@ test_priority() {
 	uci_put "hashlimit-qos.defaults.default_up_kbps=500"
 	dev_add 10.0.0.50 5000 1000 1 'dev50'
 	dev_add 10.0.0.60 0 0 1 'exempt60'
-	grp_add 10.0.0.96/28 10000 2000 1 'grp' '10.0.0.110'
+	grp_add 10.0.0.96 10.0.0.111 10000 2000 1 'grp' '10.0.0.110'
 	ctl render
 	assert_rc "render priority" 0
 
@@ -451,12 +456,12 @@ test_priority() {
 		"-A HLIMIT_UP -i br-lan -s 10.0.0.110 -j RETURN" "$(ipt_log)"
 	assert_before "group exclude before group DROP" \
 		"-A HLIMIT_UP -i br-lan -s 10.0.0.110 -j RETURN" \
-		"-A HLIMIT_UP -i br-lan -s 10.0.0.96/28 -m hashlimit" "$(ipt_log)"
+		"-A HLIMIT_UP -i br-lan -m iprange --src-range 10.0.0.96-10.0.0.111 -m hashlimit" "$(ipt_log)"
 	assert_before "group DROP before group RETURN" \
-		"-A HLIMIT_UP -i br-lan -s 10.0.0.96/28 -m hashlimit" \
-		"-A HLIMIT_UP -i br-lan -s 10.0.0.96/28 -j RETURN" "$(ipt_log)"
+		"-A HLIMIT_UP -i br-lan -m iprange --src-range 10.0.0.96-10.0.0.111 -m hashlimit" \
+		"-A HLIMIT_UP -i br-lan -m iprange --src-range 10.0.0.96-10.0.0.111 -j RETURN" "$(ipt_log)"
 	assert_before "group RETURN before default" \
-		"-A HLIMIT_UP -i br-lan -s 10.0.0.96/28 -j RETURN" \
+		"-A HLIMIT_UP -i br-lan -m iprange --src-range 10.0.0.96-10.0.0.111 -j RETURN" \
 		"-A HLIMIT_UP -i br-lan -m hashlimit --hashlimit-name hl_up_def_br_lan" "$(ipt_log)"
 	assert_before "default before end of chain" \
 		"-A HLIMIT_UP -i br-lan -m hashlimit --hashlimit-name hl_up_def_br_lan" \
@@ -467,7 +472,7 @@ test_priority() {
 		"-A HLIMIT_DOWN -o br-lan -d 10.0.0.50 -j RETURN" \
 		"-A HLIMIT_DOWN -o br-lan -d 10.0.0.110 -j RETURN" "$(ipt_log)"
 	assert_before "down group RETURN before default" \
-		"-A HLIMIT_DOWN -o br-lan -d 10.0.0.96/28 -j RETURN" \
+		"-A HLIMIT_DOWN -o br-lan -m iprange --dst-range 10.0.0.96-10.0.0.111 -j RETURN" \
 		"-A HLIMIT_DOWN -o br-lan -m hashlimit --hashlimit-name hl_down_def_br_lan" "$(ipt_log)"
 
 	# 0/0 enabled device = unlimited, no DROP rule at all
@@ -475,7 +480,7 @@ test_priority() {
 		"-i br-lan -s 10.0.0.60 -m hashlimit" "$(ipt_log)"
 	# group is one CIDR rule, not per host
 	assert_count "single group rule" \
-		"-A HLIMIT_UP -i br-lan -s 10.0.0.96/28 -m hashlimit" "$(ipt_log)" 1
+		"-A HLIMIT_UP -i br-lan -m iprange --src-range 10.0.0.96-10.0.0.111 -m hashlimit" "$(ipt_log)" 1
 	assert_count "single default rule" \
 		"-A HLIMIT_UP -i br-lan -m hashlimit --hashlimit-name hl_up_def_br_lan" "$(ipt_log)" 1
 }
@@ -618,15 +623,16 @@ test_group_crud() {
 	new_env
 	ctl group-set 10.0.0.100/28 10000 2000 '访客' 1
 	assert_rc "group-set" 0
-	assert_contains "group section" "hashlimit-qos.grp_10_0_0_96_28=group" "$UCI_STUB_STATE"
-	assert_contains "cidr normalised" "hashlimit-qos.grp_10_0_0_96_28.cidr=10.0.0.96/28" "$UCI_STUB_STATE"
+	assert_contains "group section" "hashlimit-qos.grp_10_0_0_96_10_0_0_111=group" "$UCI_STUB_STATE"
+	assert_contains "range normalised" "hashlimit-qos.grp_10_0_0_96_10_0_0_111.range=10.0.0.96-10.0.0.111" "$UCI_STUB_STATE"
+	assert_contains "start stored" "hashlimit-qos.grp_10_0_0_96_10_0_0_111.start=10.0.0.96" "$UCI_STUB_STATE"
 	assert_contains "group rule on LAN iface" \
-		"-A HLIMIT_UP -i br-lan -s 10.0.0.96/28 -m hashlimit --hashlimit-name hl_up_grp_br_lan_1" "$(ipt_log)"
+		"-A HLIMIT_UP -i br-lan -m iprange --src-range 10.0.0.96-10.0.0.111 -m hashlimit --hashlimit-name hl_up_grp_br_lan_1" "$(ipt_log)"
 
 	: >"$(ipt_log)"
 	ctl group-toggle 10.0.0.96/28 0
 	assert_rc "group-toggle off" 0
-	assert_not_contains "no rule after toggle off" "-s 10.0.0.96/28 -m hashlimit" "$(ipt_log)"
+	assert_not_contains "no rule after toggle off" "-m iprange --src-range 10.0.0.96-10.0.0.111 -m hashlimit" "$(ipt_log)"
 	ctl group-delete 10.0.0.96/28
 	assert_rc "group-delete" 0
 	ctl group-delete 10.0.0.96/28
@@ -640,15 +646,15 @@ test_group_crud() {
 test_group_exclude() {
 	section "per-group whitelist: IP/MAC, validation, idempotency"
 	new_env
-	grp_add 10.0.0.96/28 10000 2000 1 'grp'
+	grp_add 10.0.0.96 10.0.0.111 10000 2000 1 'grp'
 	ctl group-exclude-add 10.0.0.96/28 10.0.0.110
 	assert_rc "group-exclude-add ip" 0
-	assert_contains "exclude stored" "grp_10_0_0_96_28.exclude=10.0.0.110" "$UCI_STUB_STATE"
+	assert_contains "exclude stored" "grp_10_0_0_96_10_0_0_111.exclude=10.0.0.110" "$UCI_STUB_STATE"
 	assert_contains "exclude UP RETURN" "-A HLIMIT_UP -i br-lan -s 10.0.0.110 -j RETURN" "$(ipt_log)"
 	assert_contains "exclude DOWN RETURN" "-A HLIMIT_DOWN -o br-lan -d 10.0.0.110 -j RETURN" "$(ipt_log)"
 	assert_before "exclude before group DROP" \
 		"-A HLIMIT_UP -i br-lan -s 10.0.0.110 -j RETURN" \
-		"-A HLIMIT_UP -i br-lan -s 10.0.0.96/28 -m hashlimit" "$(ipt_log)"
+		"-A HLIMIT_UP -i br-lan -m iprange --src-range 10.0.0.96-10.0.0.111 -m hashlimit" "$(ipt_log)"
 
 	ctl group-exclude-add 10.0.0.96/28 10.0.0.110
 	assert_rc "duplicate idempotent" 0
@@ -672,7 +678,7 @@ test_group_exclude() {
 	# MAC exclude: with xt_mac available the UP rule matches the MAC, DOWN
 	# resolves the MAC to the current IP.
 	new_env
-	grp_add 10.0.0.96/28 10000 2000 1 'grp'
+	grp_add 10.0.0.96 10.0.0.111 10000 2000 1 'grp'
 	uci_add "hashlimit-qos.dev_mac_x=device"
 	uci_add "hashlimit-qos.dev_mac_x.mac=aa:bb:cc:dd:ee:01"
 	uci_add "hashlimit-qos.dev_mac_x.enabled=1"
@@ -727,14 +733,14 @@ assert by_ip["10.0.0.162"]["mac"] == "aa:bb:cc:dd:ee:01", d
 assert by_ip["10.0.0.162"]["name"] == "客厅电视", d
 assert by_ip["10.0.0.107"]["source"] == "lease", d
 assert by_ip["10.0.0.162"]["online"] == "1", d
-cids = [c["cidr"] for c in d["candidates"]]
-assert "10.0.0.0/8" in cids, cids
-assert "10.0.0.0/24" in cids, cids
-c24 = [c for c in d["candidates"] if c["cidr"] == "10.0.0.0/24"][0]
-assert c24["first"] == "10.0.0.0" and c24["last"] == "10.0.0.255", c24
+ranges = [c["range"] for c in d["candidates"]]
+assert "10.0.0.0-10.255.255.255" in ranges, ranges
+assert "10.0.0.0-10.0.0.255" in ranges, ranges
+c24 = [c for c in d["candidates"] if c["range"] == "10.0.0.0-10.0.0.255"][0]
+assert c24["start"] == "10.0.0.0" and c24["end"] == "10.0.0.255", c24
 assert c24["hosts"] == "2", c24
-c8 = [c for c in d["candidates"] if c["cidr"] == "10.0.0.0/8"][0]
-assert c8["first"] == "10.0.0.0" and c8["last"] == "10.255.255.255", c8
+c8 = [c for c in d["candidates"] if c["range"] == "10.0.0.0-10.255.255.255"][0]
+assert c8["start"] == "10.0.0.0" and c8["end"] == "10.255.255.255", c8
 assert "全部局域网" in c8["label"], c8
 PY
 		if [ $? -eq 0 ]; then pass; else fail "scan JSON assertions failed"; fi
@@ -757,10 +763,10 @@ import json, sys
 d = json.loads(open(sys.argv[1], encoding="utf-8").read())
 assert d["lan"][0]["cidr"] == "192.168.2.0/24", d["lan"]
 assert d["pool"] == {"start": "192.168.2.100", "end": "192.168.2.249"}, d["pool"]
-cids = [c["cidr"] for c in d["candidates"]]
-assert "192.168.2.0/24" in cids, cids
+ranges = [c["range"] for c in d["candidates"]]
+assert "192.168.2.0-192.168.2.255" in ranges, ranges
 c = d["candidates"][0]
-assert c["first"] == "192.168.2.0" and c["last"] == "192.168.2.255", c
+assert c["start"] == "192.168.2.0" and c["end"] == "192.168.2.255", c
 assert set(h["ip"] for h in d["hosts"]) == {"192.168.2.162", "192.168.2.107"}, d["hosts"]
 PY
 		if [ $? -eq 0 ]; then pass; else fail "scan 192 JSON failed"; fi
@@ -777,7 +783,7 @@ test_scan_empty() {
 import json, sys
 d = json.loads(open(sys.argv[1], encoding="utf-8").read())
 assert d["hosts"] == [], d
-assert [c["cidr"] for c in d["candidates"]] == ["10.0.0.0/8"], d["candidates"]
+assert [c["range"] for c in d["candidates"]] == ["10.0.0.0-10.255.255.255"], d["candidates"]
 PY
 		if [ $? -eq 0 ]; then pass; else fail "empty scan JSON wrong"; fi
 	fi
@@ -914,11 +920,11 @@ test_migrate_stale() {
 test_migrate_invalid_group() {
 	section "migrate: group outside LAN reported, not deleted"
 	new_env
-	grp_add 192.168.2.96/28 10000 2000 1 'old-grp'
+	grp_add 192.168.2.96 192.168.2.111 10000 2000 1 'old-grp'
 	ctl migrate
 	assert_rc "invalid group migrate" 0
-	assert_contains "invalid group note" 'invalid group 192.168.2.96/28' "$E/out"
-	assert_contains "group kept" "hashlimit-qos.grp_192_168_2_96_28=group" "$UCI_STUB_STATE"
+	assert_contains "invalid group note" 'group 192.168.2.96-192.168.2.111 is outside the current LAN' "$E/out"
+	assert_contains "group kept" "hashlimit-qos.grp_192_168_2_96_192_168_2_111=group" "$UCI_STUB_STATE"
 }
 
 # ---------------------------------------------------------------------------
@@ -944,7 +950,7 @@ EOF
 
 	ctl set - 1000 1000 '' 1 aa:bb:cc:dd:ee:01
 	assert_rc "MAC-only empty label" 0
-	assert_contains "MAC hostname" "dev_mac_1c_83_41_da_b9_63.label=客厅电视" "$UCI_STUB_STATE"
+	assert_contains "MAC hostname" "dev_mac_aa_bb_cc_dd_ee_01.label=客厅电视" "$UCI_STUB_STATE"
 }
 
 test_set_mac_commands() {
@@ -1071,7 +1077,7 @@ test_json_list() {
 	uci_put "hashlimit-qos.defaults.default_down_kbps=2000"
 	uci_put "hashlimit-qos.defaults.default_up_kbps=500"
 	dev_add 10.0.0.50 5000 1000 1 '客厅电视'
-	grp_add 10.0.0.96/28 10000 2000 1 '访客' '10.0.0.110'
+	grp_add 10.0.0.96 10.0.0.111 10000 2000 1 '访客' '10.0.0.110'
 	printf '    1234    56789 DROP all -- * * 0.0.0.0/0 10.0.0.50\n' >"$IPT_STUB_DIR/ls.mangle.HLIMIT_DOWN"
 	printf '       7      678 DROP all -- * * 10.0.0.50 0.0.0.0/0\n' >"$IPT_STUB_DIR/ls.mangle.HLIMIT_UP"
 	ctl render
@@ -1083,7 +1089,8 @@ test_json_list() {
 		python3 - "$E/out" <<'PY'
 import json, sys
 d = json.loads(open(sys.argv[1], encoding="utf-8").read())
-assert d["version"] == "1.2.0", d
+import os
+assert d["version"] == os.environ["HLIMIT_VER"], d
 assert d["enabled"] == "1", d
 dd = d["defaults"]
 assert dd["scope"] == "all-lan", dd
@@ -1099,7 +1106,8 @@ assert dev["ip"] == "10.0.0.50" and dev["label"] == "客厅电视", dev
 assert dev["down_pkts"] == 1234 and dev["down_bytes"] == 56789, dev
 assert dev["up_pkts"] == 7 and dev["up_bytes"] == 678, dev
 assert dev["in_lan"] == "1" and dev["lan_dev"] == "br-lan", dev
-assert grp["cidr"] == "10.0.0.96/28", grp
+assert grp["range"] == "10.0.0.96-10.0.0.111", grp
+assert grp["start"] == "10.0.0.96" and grp["end"] == "10.0.0.111", grp
 assert grp["exclude"] == ["10.0.0.110"], grp
 assert grp["in_lan"] == "1", grp
 assert dflt["interfaces"] == ["br-lan"], dflt
@@ -1164,7 +1172,7 @@ test_offload() {
 	# group-only limit also disables offload
 	new_env
 	fw_defaults_add 1 1
-	grp_add 10.0.0.96/28 10000 2000 1 g
+	grp_add 10.0.0.96 10.0.0.111 10000 2000 1 g
 	ctl offload-apply
 	assert_contains "group triggers offload off" "firewall.@defaults[0].flow_offloading=0" "$UCI_STUB_STATE"
 	ctl group-toggle 10.0.0.96/28 0
@@ -1238,7 +1246,7 @@ test_anonymous_sections() {
 	ctl render
 	assert_rc "anonymous render" 0
 	assert_contains "anonymous device rule" "-A HLIMIT_UP -i br-lan -s 10.0.0.50 -m hashlimit" "$(ipt_log)"
-	assert_contains "anonymous group rule" "-A HLIMIT_DOWN -o br-lan -d 10.0.0.96/28 -m hashlimit" "$(ipt_log)"
+	assert_contains "anonymous group rule" "-A HLIMIT_DOWN -o br-lan -m iprange --dst-range 10.0.0.96-10.0.0.111 -m hashlimit" "$(ipt_log)"
 	ctl set 10.0.0.50 6000 1200 'x' 1
 	assert_contains "set reuses anonymous section" "hashlimit-qos.cfg0a1b2c.down_kbps=6000" "$UCI_STUB_STATE"
 	if grep -q '^hashlimit-qos\.dev_10_0_0_50=' "$UCI_STUB_STATE"; then fail "duplicate device section"; else pass; fi
@@ -1359,7 +1367,7 @@ test_group_exclude_192() {
 	section "per-group whitelist on a 192.168.2.1/24 LAN"
 	new_env
 	lan_192
-	grp_add 192.168.2.96/28 10000 2000 1 g
+	grp_add 192.168.2.96 192.168.2.111 10000 2000 1 g
 	ctl group-exclude-add 192.168.2.96/28 192.168.2.100
 	assert_rc "group-exclude-add 192" 0
 	assert_contains "exclude UP on br-lan" \
@@ -1367,7 +1375,7 @@ test_group_exclude_192() {
 	assert_contains "exclude DOWN on br-lan" \
 		"-A HLIMIT_DOWN -o br-lan -d 192.168.2.100 -j RETURN" "$(ipt_log)"
 	assert_contains "group rule on 192 LAN" \
-		"-A HLIMIT_UP -i br-lan -s 192.168.2.96/28 -m hashlimit --hashlimit-name hl_up_grp_br_lan_1" "$(ipt_log)"
+		"-A HLIMIT_UP -i br-lan -m iprange --src-range 192.168.2.96-192.168.2.111 -m hashlimit --hashlimit-name hl_up_grp_br_lan_1" "$(ipt_log)"
 	ctl group-exclude-add 192.168.2.96/28 192.168.2.200
 	assert_rc "outside cidr rejected on 192" 2
 }
@@ -1440,7 +1448,7 @@ test_warnings_invalid() {
 	section "status/list: warnings for out-of-LAN device/group"
 	new_env
 	dev_add 192.168.2.50 5000 1000 1 'old-dev'
-	grp_add 192.168.2.96/28 10000 2000 1 'old-grp'
+	grp_add 192.168.2.96 192.168.2.111 10000 2000 1 'old-grp'
 	ctl list
 	assert_rc "list with invalid config" 0
 	if command -v python3 >/dev/null 2>&1; then
@@ -1449,7 +1457,7 @@ import json, sys
 d = json.loads(open(sys.argv[1], encoding="utf-8").read())
 w = "\n".join(d["warnings"])
 assert "old-dev" in w, w
-assert "old-grp" in w or "192.168.2.96/28" in w, w
+assert "old-grp" in w or "192.168.2.96-192.168.2.111" in w, w
 assert "IPv6" in w, w
 dev = [x for x in d["devices"] if x["kind"] == "device"][0]
 assert dev["in_lan"] == "0", dev
@@ -1501,24 +1509,25 @@ test_group_exclude_multi_lan_scope() {
 	# overwrite render_groups()'s _cidr/_dev through ip_in_lan().
 	new_env
 	lan_guest_add
-	grp_add 10.0.0.96/28 10000 2000 1 'G1'
-	grp_add 10.0.1.0/24 10000 2000 1 'G2' '52:44:2b:49:8f:e7'
+	grp_add 10.0.0.96 10.0.0.111 10000 2000 1 'G1'
+	grp_add 10.0.1.0 10.0.1.255 10000 2000 1 'G2' '52:44:2b:49:8f:e7'
 	dhcp_host_add 0 52:44:2b:49:8f:e7 10.0.0.162 'phone'
 	ctl render
 	assert_rc "render multi-LAN group with MAC exclude" 0
 
 	assert_contains "G1 keeps its own CIDR/interface" \
-		"-A HLIMIT_UP -i br-lan -s 10.0.0.96/28 -m hashlimit --hashlimit-name hl_up_grp_br_lan_1" "$(ipt_log)"
+		"-A HLIMIT_UP -i br-lan -m iprange --src-range 10.0.0.96-10.0.0.111 -m hashlimit --hashlimit-name hl_up_grp_br_lan_1" "$(ipt_log)"
 	assert_contains "G2 UP uses its own CIDR/interface" \
-		"-A HLIMIT_UP -i br-guest -s 10.0.1.0/24 -m hashlimit --hashlimit-name hl_up_grp_br_guest_2" "$(ipt_log)"
+		"-A HLIMIT_UP -i br-guest -m iprange --src-range 10.0.1.0-10.0.1.255 -m hashlimit --hashlimit-name hl_up_grp_br_guest_2" "$(ipt_log)"
 	assert_contains "G2 DOWN uses its own CIDR/interface" \
-		"-A HLIMIT_DOWN -o br-guest -d 10.0.1.0/24 -m hashlimit --hashlimit-name hl_down_grp_br_guest_2" "$(ipt_log)"
+		"-A HLIMIT_DOWN -o br-guest -m iprange --dst-range 10.0.1.0-10.0.1.255 -m hashlimit --hashlimit-name hl_down_grp_br_guest_2" "$(ipt_log)"
 	assert_contains "G2 UP RETURN uses its own CIDR/interface" \
-		"-A HLIMIT_UP -i br-guest -s 10.0.1.0/24 -j RETURN" "$(ipt_log)"
+		"-A HLIMIT_UP -i br-guest -m iprange --src-range 10.0.1.0-10.0.1.255 -j RETURN" "$(ipt_log)"
 	assert_not_contains "G2 was NOT rewritten to the first LAN net/iface (CIDR)" \
 		"-s 10.0.0.0/8 -i br-lan -m hashlimit --hashlimit-name hl_up_grp_br_lan_2" "$(ipt_log)"
-	assert_not_contains "G2 was NOT rewritten to the first LAN iface" \
-		"-A HLIMIT_UP -i br-lan -s 10.0.1.0/24 -m hashlimit" "$(ipt_log)"
+	# G1 的区间只属于 br-lan，不能被写到 br-guest 上（区间/网口不串用）
+	assert_not_contains "G1 range is not applied on br-guest" \
+		"-i br-guest -m iprange --src-range 10.0.0.96-10.0.0.111" "$(ipt_log)"
 	# the MAC whitelist resolves against the other segment but stays on G2's iface
 	assert_contains "MAC exclude resolves to IP on G2 iface (UP)" \
 		"-A HLIMIT_UP -i br-guest -s 10.0.0.162 -j RETURN" "$(ipt_log)"
@@ -1528,12 +1537,12 @@ test_group_exclude_multi_lan_scope() {
 	# same scenario with a plain IP whitelist
 	new_env
 	lan_guest_add
-	grp_add 10.0.0.96/28 10000 2000 1 'G1'
-	grp_add 10.0.1.0/24 10000 2000 1 'G2' '10.0.1.50'
+	grp_add 10.0.0.96 10.0.0.111 10000 2000 1 'G1'
+	grp_add 10.0.1.0 10.0.1.255 10000 2000 1 'G2' '10.0.1.50'
 	ctl render
 	assert_rc "render multi-LAN group with IP exclude" 0
 	assert_contains "G2 UP stays on its CIDR/iface (IP exclude)" \
-		"-A HLIMIT_UP -i br-guest -s 10.0.1.0/24 -m hashlimit --hashlimit-name hl_up_grp_br_guest_2" "$(ipt_log)"
+		"-A HLIMIT_UP -i br-guest -m iprange --src-range 10.0.1.0-10.0.1.255 -m hashlimit --hashlimit-name hl_up_grp_br_guest_2" "$(ipt_log)"
 	assert_contains "IP exclude RETURN on G2 iface" \
 		"-A HLIMIT_UP -i br-guest -s 10.0.1.50 -j RETURN" "$(ipt_log)"
 	assert_not_contains "G2 not rewritten to first LAN (IP exclude)" \
