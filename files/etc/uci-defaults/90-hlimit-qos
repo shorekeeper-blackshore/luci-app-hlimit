@@ -1,0 +1,27 @@
+#!/bin/sh
+# First-boot (and first-install) defaults for luci-app-hlimit 1.3.
+# This file is sourced by /etc/init.d/boot in a subshell; `exit 0` makes the
+# boot script remove it afterwards. Every step is idempotent, so being run
+# both from the package postinst and from boot is harmless.
+#
+# On upgrade from v1.0 the first `render` also removes the stale filter-table
+# jumps/chains and recreates everything in the mangle table, and existing
+# device sections are kept untouched (conffile /etc/config/hashlimit-qos).
+
+[ -x /usr/sbin/hlimit-ctl ] || exit 0
+
+# autostart after reboot
+/etc/init.d/hashlimit-qos enable 2>/dev/null
+
+# keep the mangle jumps across fw3 reloads (marked block in /etc/firewall.user)
+/usr/sbin/hlimit-ctl install-hook 2>/dev/null
+
+# adapt old (192.168.x / stale) device IPs to the current LAN, drop the
+# obsolete default_cidr / default_exclude fields (idempotent)
+/usr/sbin/hlimit-ctl migrate >/dev/null 2>&1 || true
+
+# apply the current configuration (offload is also handled by init.d start)
+/usr/sbin/hlimit-ctl offload-apply 2>/dev/null
+/usr/sbin/hlimit-ctl render 2>/dev/null
+
+exit 0

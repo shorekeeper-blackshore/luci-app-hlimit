@@ -1,0 +1,13 @@
+{
+	"admin/network/hlimit": {
+		"title": "设备限速",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "hlimit/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-hlimit" ]
+		}
+	}
+}

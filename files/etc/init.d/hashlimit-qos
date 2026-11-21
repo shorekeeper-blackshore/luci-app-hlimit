@@ -1,0 +1,40 @@
+#!/bin/sh /etc/rc.common
+# luci-app-hlimit service: (re)build the HLIMIT_* iptables chains in the mangle
+# table (PREROUTING = upload, POSTROUTING = download, see v1.1 contract).
+# There is no daemon, so plain start/stop/reload functions are enough.
+# The /etc/firewall.user hook installed by `hlimit-ctl install-hook` calls
+# `hlimit-ctl render` after every fw3 reload, which is what keeps the mangle
+# jumps alive across `firewall restart` / reboots.
+
+START=99
+STOP=10
+
+start() {
+	[ -x /usr/sbin/hlimit-ctl ] || return 0
+	# adapt a configuration from an older subnet to the current LAN first
+	# (failure must never block the firewall rules)
+	/usr/sbin/hlimit-ctl migrate >/dev/null 2>&1 || true
+	# disable FLOWOFFLOAD first when a rule limits something, otherwise the
+	# rules would be bypassed by established offloaded flows
+	/usr/sbin/hlimit-ctl offload-apply
+	/usr/sbin/hlimit-ctl render
+}
+
+stop() {
+	[ -x /usr/sbin/hlimit-ctl ] || return 0
+	/usr/sbin/hlimit-ctl flush
+	# give the original FLOWOFFLOAD settings back
+	/usr/sbin/hlimit-ctl offload-restore
+}
+
+reload() {
+	[ -x /usr/sbin/hlimit-ctl ] || return 0
+	/usr/sbin/hlimit-ctl migrate >/dev/null 2>&1 || true
+	/usr/sbin/hlimit-ctl offload-apply
+	/usr/sbin/hlimit-ctl render
+}
+
+# avoid a double offload restart on stop+start
+restart() {
+	start
+}

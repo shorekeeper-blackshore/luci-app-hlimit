@@ -1,0 +1,124 @@
+#!/bin/sh
+# Minimal `uci` stand-in for the hlimit-ctl unit tests (v1.1).
+#
+# State is a flat file of "key=value" lines (section type keys included, e.g.
+# "hashlimit-qos.defaults=defaults").  A key may appear more than once: that is
+# how UCI list options are represented (add_list/del_list, read via `get` which
+# joins the values with spaces).
+#
+# Env:
+#   UCI_STUB_STATE   path to the state file (required)
+
+STATE=${UCI_STUB_STATE:?UCI_STUB_STATE not set}
+
+[ -f "$STATE" ] || : >"$STATE"
+
+# optional call log for tests that assert commit behaviour
+[ -n "${UCI_STUB_LOG:-}" ] && printf '%s\n' "$*" >>"$UCI_STUB_LOG"
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-q) shift ;;
+	*) break ;;
+	esac
+done
+
+cmd=${1-}
+[ $# -gt 0 ] && shift
+
+state_set_scalar() {
+	key=$1
+	val=$2
+	tmp="$STATE.tmp.$$"
+	awk -v k="$key" -v v="$val" '
+		index($0, k "=") == 1 { next }
+		{ print }
+		END { print k "=" v }
+	' "$STATE" >"$tmp" && mv "$tmp" "$STATE"
+}
+
+state_get() {
+	awk -v k="$1" '
+		index($0, k "=") == 1 {
+			if (n++) printf " "
+			printf "%s", substr($0, length(k) + 2)
+			found = 1
+		}
+		END { if (!found) exit 1 }
+	' "$STATE"
+}
+
+state_del() {
+	key=$1
+	tmp="$STATE.tmp.$$"
+	awk -v k="$key" '
+		index($0, k "=") == 1 { next }
+		index($0, k ".") == 1 { next }
+		{ print }
+	' "$STATE" >"$tmp" && mv "$tmp" "$STATE"
+}
+
+state_add_list() {
+	printf '%s=%s\n' "$1" "$2" >>"$STATE"
+}
+
+state_del_list() {
+	key=$1
+	val=$2
+	tmp="$STATE.tmp.$$"
+	awk -v k="$key" -v v="$val" '
+		index($0, k "=") == 1 && substr($0, length(k) + 2) == v { next }
+		{ print }
+	' "$STATE" >"$tmp" && mv "$tmp" "$STATE"
+}
+
+case "$cmd" in
+get)
+	state_get "${1-}"
+	;;
+set)
+	arg=${1-}
+	case "$arg" in
+	*=*)
+		key=${arg%%=*}
+		val=${arg#*=}
+		;;
+	*)
+		key=$arg
+		val=${2-}
+		;;
+	esac
+	state_set_scalar "$key" "$val"
+	;;
+add_list)
+	arg=${1-}
+	state_add_list "${arg%%=*}" "${arg#*=}"
+	;;
+del_list)
+	arg=${1-}
+	state_del_list "${arg%%=*}" "${arg#*=}"
+	;;
+delete)
+	state_del "${1-}"
+	;;
+show)
+	cfg=${1-}
+	# real `uci show` prints option values quoted: key='value'
+	awk -v p="$cfg." 'index($0, p) == 1 {
+		eq = index($0, "=")
+		if (eq == 0) { print; next }
+		k = substr($0, 1, eq - 1)
+		v = substr($0, eq + 1)
+		printf "%s=%c%s%c\n", k, 39, v, 39
+	}' "$STATE"
+	;;
+commit|revert|changes|export)
+	# no-op for the tests
+	;;
+*)
+	printf 'uci(stub): unsupported command: %s\n' "$cmd" >&2
+	exit 1
+	;;
+esac
+
+exit 0

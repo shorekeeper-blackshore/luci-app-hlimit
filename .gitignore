@@ -1,0 +1,12 @@
+# build artifacts (produced by scripts/build-ipk.sh)
+build/
+*.ipk
+*.ipk.tmp
+*.tar.gz
+
+# editors / OS
+.DS_Store
+*.swp
+*~
+/.vscode/
+/.idea/

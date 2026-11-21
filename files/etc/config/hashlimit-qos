@@ -1,0 +1,92 @@
+# /etc/config/hashlimit-qos - luci-app-hlimit 1.2.0 configuration
+#
+# UCI section types:
+#   defaults  (one)    global switch + default (catch-all) limit
+#   device    (many)   one individually throttled client (highest priority)
+#   group     (many)   one throttled CIDR (batch, middle priority)
+#
+# v1.2: the LAN scope is detected at runtime (firewall zone name=lan ->
+# network devices -> their IPv4 subnets).  The default limit automatically
+# covers every LAN interface, therefore defaults.default_cidr and
+# defaults.default_exclude no longer exist (they are ignored if present and
+# removed by `hlimit-ctl migrate`).
+#
+# defaults options:
+#   enabled                1 = service on, 0 = flush all rules
+#   auto_disable_offload   1 = temporarily disable TurboACC flow offloading
+#   default_enabled        1 = limit every LAN client (default 0/off)
+#   default_down_kbps      default download limit in kbit/s, 0 = unlimited
+#   default_up_kbps        default upload limit in kbit/s, 0 = unlimited
+#
+# device options:
+#   ip          IPv4 address inside a LAN subnet (optional when mac is set)
+#   mac         MAC address (optional; resolved to the current IP at render
+#               time) - when both are set the MAC is resolved first
+#   label       name shown in LuCI (<=32 chars).  Empty -> current hostname,
+#               then the IP/MAC.
+#   enabled     1 = apply this device, 0 = ignore (default 1)
+#   down_kbps   download limit in kbit/s, 0 = unlimited (default 0)
+#   up_kbps     upload limit in kbit/s, 0 = unlimited (default 0)
+#   mode        auto | hashlimit | quota2 (default auto; hashlimit is used)
+#
+#   enabled=1 with down_kbps=0 AND up_kbps=0 means "this device is unlimited":
+#   it still wins over a group and over the default limit (exemption).
+#
+# group options:
+#   cidr        one CIDR inside a LAN subnet, e.g. 10.0.0.96/28
+#   label       free-form name shown in LuCI
+#   enabled     1 = apply this group, 0 = ignore
+#   down_kbps   download limit in kbit/s, 0 = unlimited
+#   up_kbps     upload limit in kbit/s, 0 = unlimited
+#   exclude     list of IPs or MACs that are not limited by THIS group only
+#
+# Priority: device > per-group exclude > group > default limit.
+# Values are written by the LuCI page through /usr/sbin/hlimit-ctl, do not edit
+# the file by hand while the service is running (run `hlimit-ctl render` after).
+
+config defaults 'defaults'
+	option enabled '1'
+	# automatically disable FLOWOFFLOAD/turboacc while a limit is active
+	option auto_disable_offload '1'
+	# catch-all limit over every LAN interface, off by default
+	option default_enabled '0'
+	option default_down_kbps '0'
+	option default_up_kbps '0'
+
+# Example device (the LuCI page creates these sections automatically).
+# Any private IPv4 prefix works - the examples show both a /8 and a /24 LAN:
+#config device 'dev_10_0_0_162'
+#	option ip '10.0.0.162'
+#	option mac 'aa:bb:cc:dd:ee:01'
+#	option label '客厅电视'
+#	option enabled '1'
+#	option down_kbps '50000'
+#	option up_kbps '25000'
+#	option mode 'auto'
+#
+#config device 'dev_192_168_2_50'
+#	option ip '192.168.2.50'
+#	option mac 'aa:bb:cc:dd:ee:02'
+#	option label '客厅电视'
+#	option enabled '1'
+#	option down_kbps '5120'
+#	option up_kbps '1024'
+#	option mode 'auto'
+
+# Example batch group with a per-group unlimited list:
+#config group 'grp_10_0_0_96_28'
+#	option cidr '10.0.0.96/28'
+#	option label '访客网段'
+#	option enabled '1'
+#	option down_kbps '10000'
+#	option up_kbps '2000'
+#	list exclude '10.0.0.110'
+#	list exclude 'aa:bb:cc:dd:ee:01'
+#
+#config group 'grp_192_168_2_96_28'
+#	option cidr '192.168.2.96/28'
+#	option label '访客网段'
+#	option enabled '1'
+#	option down_kbps '10000'
+#	option up_kbps '2000'
+#	list exclude '192.168.2.110'

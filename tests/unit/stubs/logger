@@ -1,0 +1,5 @@
+#!/bin/sh
+# `logger` stand-in for the hlimit-ctl unit tests: record the message so the
+# tests can assert that burst fallback warnings reach logread.
+[ -n "${LOGGER_LOG:-}" ] && printf '%s\n' "$*" >>"$LOGGER_LOG"
+exit 0

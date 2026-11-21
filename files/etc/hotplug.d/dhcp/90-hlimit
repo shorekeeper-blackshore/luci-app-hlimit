@@ -1,0 +1,40 @@
+#!/bin/sh
+# /etc/hotplug.d/dhcp/90-hlimit - keep MAC -> IP resolution up to date.
+#
+# A device may be configured by MAC only; hlimit-ctl resolves the MAC to the
+# current IP through dhcp static hosts -> /tmp/dhcp.leases -> /proc/net/arp.
+# v1.2: a re-render also re-detects the LAN scope (an IP change inside the LAN
+# only needs the new address, the `-i/-o br-lan` qualifiers stay the same).
+# DHCP events arrive in bursts (a lease renewal triggers add/update/old), so a
+# short debounce is used: the first event starts a detached render, the
+# following events see the lock and do nothing.
+#
+# Tunables (env, mainly for tests):
+#   HLIMIT_HOTPLUG_DELAY  debounce seconds (default 5, 0 = render synchronously)
+#   HLIMIT_HOTPLUG_LOCK   lock directory (default /tmp/hlimit-hotplug-render.lock)
+#   HLIMIT_CTL_BIN        backend path (default /usr/sbin/hlimit-ctl)
+
+CTL=${HLIMIT_CTL_BIN:-/usr/sbin/hlimit-ctl}
+DELAY=${HLIMIT_HOTPLUG_DELAY:-5}
+LOCK=${HLIMIT_HOTPLUG_LOCK:-/tmp/hlimit-hotplug-render.lock}
+
+[ -x "$CTL" ] || exit 0
+
+case "$DELAY" in
+''|*[!0-9]*) DELAY=5 ;;
+esac
+
+if [ "$DELAY" = 0 ]; then
+	"$CTL" render >/dev/null 2>&1
+	exit 0
+fi
+
+if mkdir "$LOCK" 2>/dev/null; then
+	(
+		sleep "$DELAY"
+		"$CTL" render >/dev/null 2>&1
+		rmdir "$LOCK" 2>/dev/null
+	) >/dev/null 2>&1 &
+fi
+
+exit 0

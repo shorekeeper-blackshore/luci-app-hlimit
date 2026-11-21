@@ -1,0 +1,50 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  ipk:
+    name: build ipk
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show environment
+        run: |
+          tar --version | head -1
+          gzip --version | head -1
+          sh --version 2>/dev/null || true
+
+      - name: Build
+        run: sh scripts/build-ipk.sh
+
+      - name: Checksums
+        run: sha256sum build/*.ipk build/*.tar.gz | tee build/sha256sums.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-hlimit-ipk
+          path: |
+            build/*.ipk
+            build/*.tar.gz
+            build/sha256sums.txt
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            build/*.ipk build/*.tar.gz build/sha256sums.txt \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes

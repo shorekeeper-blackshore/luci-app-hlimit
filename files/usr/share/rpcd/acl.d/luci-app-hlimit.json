@@ -1,0 +1,38 @@
+{
+	"luci-app-hlimit": {
+		"description": "Grant access to device rate limiting (luci-app-hlimit)",
+		"read": {
+			"file": {
+				"/usr/sbin/hlimit-ctl list": [ "exec" ],
+				"/usr/sbin/hlimit-ctl status": [ "exec" ],
+				"/usr/sbin/hlimit-ctl devices": [ "exec" ],
+				"/usr/sbin/hlimit-ctl scan": [ "exec" ],
+				"/usr/sbin/hlimit-ctl offload-status": [ "exec" ]
+			},
+			"ubus": {
+				"file": [ "exec" ]
+			},
+			"uci": [ "hashlimit-qos" ]
+		},
+		"write": {
+			"file": {
+				"/usr/sbin/hlimit-ctl apply": [ "exec" ],
+				"/usr/sbin/hlimit-ctl render": [ "exec" ],
+				"/usr/sbin/hlimit-ctl offload-apply": [ "exec" ],
+				"/usr/sbin/hlimit-ctl offload-restore": [ "exec" ],
+				"/usr/sbin/hlimit-ctl offload-*": [ "exec" ],
+				"/usr/sbin/hlimit-ctl set *": [ "exec" ],
+				"/usr/sbin/hlimit-ctl delete *": [ "exec" ],
+				"/usr/sbin/hlimit-ctl toggle *": [ "exec" ],
+				"/usr/sbin/hlimit-ctl global *": [ "exec" ],
+				"/usr/sbin/hlimit-ctl group-*": [ "exec" ],
+				"/usr/sbin/hlimit-ctl set-default *": [ "exec" ],
+				"/usr/sbin/hlimit-ctl exclude-*": [ "exec" ]
+			},
+			"ubus": {
+				"file": [ "exec" ]
+			},
+			"uci": [ "hashlimit-qos" ]
+		}
+	}
+}

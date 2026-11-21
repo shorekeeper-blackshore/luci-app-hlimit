@@ -1,0 +1,183 @@
+#!/bin/sh
+# Minimal `iptables` stand-in for the hlimit-ctl unit tests (v1.1).
+#
+# Every invocation is appended to $IPT_STUB_DIR/log (one line per call with the
+# raw arguments, including `-t <table>`).  Chain/jump state is kept in plain
+# files so that idempotency, mangle jumps and stale filter-table cleanup can be
+# asserted.  `-L` prints the header plus the optional fixture file
+# $IPT_STUB_DIR/ls.<table>.<chain> (fallback: ls.<chain>).
+#
+# Env:
+#   IPT_STUB_DIR        state directory (required)
+#   IPT_STUB_FAIL_N     "1" -> fail chain creation
+#   IPT_STUB_FAIL_ADD   substring -> fail matching -A rules
+#   IPT_STUB_BURST_MIN  emulate old libxt_hashlimit: reject --hashlimit-burst
+#                       smaller than this value (kb) with the kernel error
+#   IPT_STUB_MAC_HELP   "1" -> `-m mac --help` prints a --mac-source option
+#                       (simulates a build where the xt_mac match is usable)
+
+D=${IPT_STUB_DIR:?IPT_STUB_DIR not set}
+mkdir -p "$D" 2>/dev/null || true
+
+CH=$D/chains
+JP=$D/jumps
+LOG=$D/log
+[ -f "$CH" ] || : >"$CH"
+[ -f "$JP" ] || : >"$JP"
+
+RAW=$*
+TBL=filter
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-t)
+		TBL=${2-filter}
+		shift 2
+		;;
+	-w|--wait|-W)
+		shift
+		;;
+	*) break ;;
+	esac
+done
+
+cmd=${1-}
+[ $# -gt 0 ] && shift
+chain=${1-}
+
+# builtin chains (per table), so `-L`/`-X` behave like the real thing
+for _t in filter mangle; do
+	for _b in PREROUTING POSTROUTING FORWARD INPUT OUTPUT; do
+		grep -qx "$_t $_b" "$CH" 2>/dev/null || printf '%s %s\n' "$_t" "$_b" >>"$CH"
+	done
+done
+
+printf '%s\n' "$RAW" >>"$LOG"
+
+chain_exists() { grep -qx "$TBL $1" "$CH" 2>/dev/null; }
+
+get_burst_kb() {
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--hashlimit-burst)
+			printf '%s' "${2%kb}"
+			return 0
+			;;
+		esac
+		shift
+	done
+	return 1
+}
+
+parse_jump_target() {
+	while [ $# -gt 0 ]; do
+		if [ "$1" = "-j" ]; then
+			printf '%s' "${2-}"
+			return 0
+		fi
+		shift
+	done
+	return 1
+}
+
+case "$cmd" in
+-m)
+	# `iptables -m mac --help`: print the option only when simulating xt_mac
+	if [ "${IPT_STUB_MAC_HELP:-0}" = 1 ]; then
+		printf 'mac match options:\n[!] --mac-source address\n'
+	fi
+	exit 0
+	;;
+-N)
+	if chain_exists "$chain"; then
+		printf 'iptables(stub): chain already exists: %s\n' "$chain" >&2
+		exit 1
+	fi
+	[ "${IPT_STUB_FAIL_N:-0}" = 1 ] && exit 1
+	printf '%s %s\n' "$TBL" "$chain" >>"$CH"
+	exit 0
+	;;
+-F)
+	chain_exists "$chain" || exit 1
+	rm -f "$D/rules.$TBL.$chain"
+	exit 0
+	;;
+-X)
+	chain_exists "$chain" || exit 1
+	case "$chain" in
+	INPUT|OUTPUT|FORWARD|PREROUTING|POSTROUTING) exit 1 ;;
+	esac
+	if awk -v t="$TBL" -v c="$chain" '$1 == t && $3 == c { found = 1 } END { exit !found }' "$JP"; then
+		exit 1
+	fi
+	awk -v t="$TBL" -v c="$chain" '!($1 == t && $2 == c)' "$CH" >"$CH.tmp.$$" && mv "$CH.tmp.$$" "$CH"
+	exit 0
+	;;
+-C)
+	target=$(parse_jump_target "$@") || exit 1
+	awk -v t="$TBL" -v p="$chain" -v g="$target" '$1 == t && $2 == p && $3 == g { found = 1 } END { exit !found }' "$JP"
+	;;
+-I)
+	target=$(parse_jump_target "$@") || exit 1
+	awk -v t="$TBL" -v p="$chain" -v g="$target" '$1 == t && $2 == p && $3 == g { found = 1 } END { exit !found }' "$JP" ||
+		printf '%s %s %s\n' "$TBL" "$chain" "$target" >>"$JP"
+	exit 0
+	;;
+-D)
+	target=$(parse_jump_target "$@") || exit 1
+	tmp="$JP.tmp.$$"
+	awk -v t="$TBL" -v p="$chain" -v g="$target" '
+		BEGIN { found = 0 }
+		$1 == t && $2 == p && $3 == g && !found { found = 1; next }
+		{ print }
+		END { exit !found }
+	' "$JP" >"$tmp"
+	st=$?
+	mv "$tmp" "$JP"
+	exit "$st"
+	;;
+-A)
+	chain_exists "$chain" || exit 1
+	shift
+	_burst=$(get_burst_kb "$@" || true)
+	if [ -n "${IPT_STUB_BURST_MIN:-}" ] && [ -n "$_burst" ] && [ "$_burst" -lt "$IPT_STUB_BURST_MIN" ]; then
+		printf 'iptables(stub): burst cannot be smaller than %sb\n' "$((IPT_STUB_BURST_MIN * 1024))" >&2
+		exit 1
+	fi
+	if [ -n "${IPT_STUB_FAIL_ADD:-}" ]; then
+		case "$*" in
+		*"$IPT_STUB_FAIL_ADD"*) exit 1 ;;
+		esac
+	fi
+	printf '%s\n' "$*" >>"$D/rules.$TBL.$chain"
+	exit 0
+	;;
+-L)
+	chain_exists "$chain" || exit 1
+	printf 'Chain %s (1 references)\n' "$chain"
+	printf '    pkts      bytes target     prot opt in     out     source               destination\n'
+	if [ -f "$D/ls.$TBL.$chain" ]; then
+		cat "$D/ls.$TBL.$chain"
+	elif [ -f "$D/ls.$chain" ]; then
+		cat "$D/ls.$chain"
+	fi
+	exit 0
+	;;
+-S)
+	if [ -n "$chain" ]; then
+		chain_exists "$chain" || exit 1
+		if [ -f "$D/rules.$TBL.$chain" ]; then
+			while IFS= read -r line; do
+				printf -- '-A %s %s\n' "$chain" "$line"
+			done <"$D/rules.$TBL.$chain"
+		fi
+	else
+		for c in $(awk -v t="$TBL" '$1 == t { print $2 }' "$CH"); do
+			printf -- '-N %s\n' "$c"
+		done
+	fi
+	exit 0
+	;;
+*)
+	exit 0
+	;;
+esac

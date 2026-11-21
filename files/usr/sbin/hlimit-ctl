@@ -1,0 +1,2931 @@
+#!/bin/sh
+# ---------------------------------------------------------------------------
+# hlimit-ctl - luci-app-hlimit backend, version 1.3.4
+# (OpenWrt / busybox ash, POSIX sh)
+#
+# Target: LEDE 24.10, kernel 6.6.75, fw3 + iptables legacy, no tc/nft/htb/ifb.
+# The only usable rate limiting primitive there is `iptables -m hashlimit`
+# (drop based policing).
+#
+# v1.3 changes:
+#   * batch rules match an arbitrary IPv4 range (start - end) instead of a
+#     CIDR: `-m iprange --src-range a-b` (upload) / `--dst-range a-b`
+#     (download).  xt_iprange is built into the reference kernel (6.6.75) and
+#     autoloaded at boot (/etc/modules.d/ipt-iprange), so no new package is
+#     needed.  Old groups are converted by `migrate` (cidr -> network-broadcast
+#     range), and a CIDR is still accepted wherever a range is expected.
+#   * per-group whitelists accept single IPs, MACs and (optionally) ranges;
+#     they stay inside the group range.
+#
+# v1.2 changes (see docs/CONTRACT-v3.md):
+#   * LAN scope is detected at runtime: firewall zone name=lan -> network
+#     devices -> `ip -4 addr`.  Every rule is qualified with `-i <lan_dev>`
+#     (upload) or `-o <lan_dev>` (download) because the WAN subnet can overlap
+#     the LAN (10.148.0.0/14 inside LAN 10.0.0.0/8 on the reference device).
+#   * the default limit covers every LAN interface (no CIDR is configured);
+#     the LAN IPs are exempt at the top of the UP chain only (see
+#     render_gateway_returns(): a DOWN -s <lan_ip> exemption would also
+#     match OpenClash proxy replies, whose source is the router LAN IP).
+#   * per-group whitelists (group.exclude, IP or MAC) and the new commands
+#     scan / migrate / group-exclude-add / group-exclude-del.
+#   * old default_cidr / default_exclude are ignored and removed by migrate.
+#
+# v1.1 changes (see docs/CONTRACT-v2.md):
+#   * hooks moved from the filter table (FORWARD/INPUT/OUTPUT) to the mangle
+#     table: UP = mangle PREROUTING (before DNAT / OpenClash REDIRECT),
+#     DOWN = mangle POSTROUTING.  This fixes the proxy upload bypass where
+#     OpenClash's `ACCEPT ctstate DNAT` in filter INPUT came before HLIMIT_UP.
+#     render/flush also remove the stale v1.0 filter jumps/chains.
+#   * batch limiting by CIDR (group sections, one hashlimit rule per CIDR);
+#     hashlimit mode srcip/dstip is per-IP, so a /24 is one rule, not 254.
+#     v1.3 replaces the CIDR matcher with an IP range matcher (see above).
+#   * priority: device > per-group whitelist > group > default (each level
+#     ends with a RETURN so the packet cannot fall through to the next level).
+#   * MAC support: a device may be identified by MAC.  The MAC is resolved to
+#     the current IP via dhcp static hosts -> /tmp/dhcp.leases -> /proc/net/arp.
+#     The UP rule prefers `-m mac --mac-source` when the xt_mac extension is
+#     usable (on the reference LEDE build libxt_mac.so is missing but the match
+#     still works through iptables' built-in/iptables-mod-extra extension, so
+#     both `iptables -m mac --help` and the .so files are probed), otherwise the
+#     resolved IP is used; DOWN always uses the resolved IP.
+#     /etc/hotplug.d/dhcp/90-hlimit re-renders on a lease change.
+#
+# Commands:
+#   render            rebuild HLIMIT_UP / HLIMIT_DOWN, attach mangle jumps (idempotent)
+#   flush             remove all jumps/chains owned by this plugin (idempotent)
+#   list              one-line JSON: rules (kind device/group/default) + defaults
+#   status            list + offload state fields
+#   default-status    one-line JSON with the default-limit configuration
+#   devices           LAN hosts only (dhcp static + leases + reachable ARP)
+#   scan              LAN subnets + DHCP pool + hosts + range candidates (JSON)
+#   migrate           adapt an old-subnet / v1.1 config to the current LAN (JSON)
+#   global <0|1>      write defaults.enabled, offload handling, commit, render
+#   set  <ip|-> <down_kbps> <up_kbps> [label] [enabled] [mac]   UCI + render
+#   delete <ip|mac>                                     UCI commit + render
+#   toggle <ip|mac> <0|1>                               UCI commit + render
+#   group-set <start> <end> <down_kbps> <up_kbps> [label] [enabled]
+#   group-set <range|cidr> <down_kbps> <up_kbps> [label] [enabled]  (compat form)
+#   group-delete <range|cidr> / group-toggle <range|cidr> <0|1>
+#   group-exclude-add <range|cidr> <ip|mac|range> / group-exclude-del ...
+#   set-default <0|1> <down_kbps> <up_kbps> [cidr-ignored]
+#   exclude-add/exclude-del  DEPRECATED (v1.2: per-group whitelist)
+#   apply             commit + migrate + offload-apply + render (LuCI apply)
+#   offload-apply     disable flow offloading when at least one rule limits
+#   offload-restore   restore the values saved by offload-apply (idempotent)
+#   offload-status    one-line JSON with the current offload state
+#   install-hook      idempotently append hook to /etc/firewall.user (backup first)
+#   remove-hook       remove only the hook block, keep the rest of the file
+#
+# Exit codes: 0 ok, 1 usage error, 2 invalid argument, 3 UCI/iptables failure
+# ---------------------------------------------------------------------------
+
+VERSION=1.3.4
+
+CONFIG=${HLIMIT_CONFIG:-hashlimit-qos}
+UCI=${HLIMIT_UCI:-uci}
+IPT=${HLIMIT_IPTABLES:-iptables}
+FW_USER=${HLIMIT_FIREWALL_USER:-/etc/firewall.user}
+FW_BACKUP=${FW_USER}.bak.hlimit
+LEASES_FILE=${HLIMIT_LEASES:-/tmp/dhcp.leases}
+ARP_FILE=${HLIMIT_ARP:-/proc/net/arp}
+OFFLOAD_LOCK=${HLIMIT_OFFLOAD_LOCK:-/tmp/hlimit-offload.lock}
+LOGGER_BIN=${HLIMIT_LOGGER:-logger}
+
+CHAIN_UP=HLIMIT_UP
+CHAIN_DOWN=HLIMIT_DOWN
+HOOK_BEGIN='# BEGIN hlimit-qos (managed by luci-app-hlimit, do not edit)'
+HOOK_LINE='[ -x /usr/sbin/hlimit-ctl ] && HLIMIT_IN_FW3=1 /usr/sbin/hlimit-ctl render >/dev/null 2>&1'
+HOOK_END='# END hlimit-qos'
+
+MAX_KBPS=1000000
+MAX_LABEL=32
+
+err() { printf 'hlimit-ctl: %s\n' "$*" >&2; }
+die() { _code=$1; shift; err "$*"; exit "$_code"; }
+log_warn() {
+	err "$*"
+	# keep a trace in logread (the LuCI page cannot see our stderr)
+	"$LOGGER_BIN" -t hlimit-qos "$*" >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
+# UCI access (reads through the uci CLI so that quoting/escaping stays correct)
+# ---------------------------------------------------------------------------
+
+uci_get() {
+	"$UCI" -q get "$CONFIG.$1" 2>/dev/null
+}
+
+uci_raw() {
+	"$UCI" -q get "$1" 2>/dev/null
+}
+
+config_sections() {
+	# print named sections in file order (deduplicated)
+	"$UCI" -q show "$CONFIG" 2>/dev/null |
+		sed -n "s/^$CONFIG\.\([^.=]*\)=.*/\1/p" |
+		awk '!seen[$0]++'
+}
+
+section_type() {
+	"$UCI" -q get "$CONFIG.$1" 2>/dev/null
+}
+
+device_sections() {
+	for _sec in $(config_sections); do
+		[ "$(section_type "$_sec")" = device ] && printf '%s\n' "$_sec"
+	done
+}
+
+group_sections() {
+	for _sec in $(config_sections); do
+		[ "$(section_type "$_sec")" = group ] && printf '%s\n' "$_sec"
+	done
+}
+
+find_section_by_ip() {
+	_want=$1
+	for _sec in $(device_sections); do
+		[ "$(uci_get "$_sec.ip")" = "$_want" ] || continue
+		printf '%s' "$_sec"
+		return 0
+	done
+	return 1
+}
+
+find_section_by_mac() {
+	_want=$(norm_mac "$1")
+	[ -n "$_want" ] || return 1
+	for _sec in $(device_sections); do
+		[ "$(norm_mac "$(uci_get "$_sec.mac")")" = "$_want" ] || continue
+		printf '%s' "$_sec"
+		return 0
+	done
+	return 1
+}
+
+find_group_by_range() {
+	_fgr_want=$(normalize_range "$1") || return 1
+	[ -n "$_fgr_want" ] || return 1
+	for _sec in $(group_sections); do
+		_fgr_got=$(group_range "$_sec") || continue
+		[ "$_fgr_got" = "$_fgr_want" ] || continue
+		printf '%s' "$_sec"
+		return 0
+	done
+	return 1
+}
+
+cfg_enabled() {
+	_v=$(uci_get defaults.enabled)
+	[ -n "$_v" ] || _v=1
+	norm_bool "$_v" 2>/dev/null || printf '0'
+}
+
+auto_disable_offload() {
+	_v=$(uci_get defaults.auto_disable_offload)
+	[ -n "$_v" ] || _v=1
+	norm_bool "$_v" 2>/dev/null || printf '1'
+}
+
+default_enabled() {
+	_v=$(uci_get defaults.default_enabled)
+	[ -n "$_v" ] || _v=0
+	norm_bool "$_v" 2>/dev/null || printf '0'
+}
+
+default_down_kbps() { norm_kbps "$(uci_get defaults.default_down_kbps)"; }
+default_up_kbps() { norm_kbps "$(uci_get defaults.default_up_kbps)"; }
+
+norm_bool() {
+	case "$1" in
+	1|on|true|yes|enabled) printf '1' ;;
+	0|off|false|no|disabled|'') printf '0' ;;
+	*) return 1 ;;
+	esac
+}
+
+norm_kbps() {
+	# canonical non-negative integer, empty/invalid -> 0 (callers validate input)
+	case "$1" in
+	''|*[!0-9]*) printf '0' ;;
+	*) printf '%s' "$1" ;;
+	esac
+}
+
+# ---------------------------------------------------------------------------
+# Validation & conversion helpers
+# ---------------------------------------------------------------------------
+
+valid_ipv4() {
+	case "$1" in
+	''|.*|*.|*[!0-9.]*) return 1 ;;
+	*.*.*.*) ;;
+	*) return 1 ;;
+	esac
+	_oldifs=$IFS
+	IFS=.
+	set -- $1
+	IFS=$_oldifs
+	[ $# -eq 4 ] || return 1
+	for _octet in "$@"; do
+		case "$_octet" in
+		''|*[!0-9]*) return 1 ;;
+		0) ;;
+		0*) return 1 ;;   # reject octal-looking values (inet_aton would misparse)
+		esac
+		[ "$_octet" -le 255 ] || return 1
+	done
+	return 0
+}
+
+valid_prefix() {
+	case "$1" in
+	''|*[!0-9]*) return 1 ;;
+	0) return 0 ;;
+	0*) return 1 ;;
+	esac
+	[ ${#1} -le 2 ] || return 1
+	[ "$1" -le 32 ] || return 1
+	return 0
+}
+
+valid_cidr() {
+	case "$1" in
+	*/*) ;;
+	*) return 1 ;;
+	esac
+	valid_ipv4 "${1%/*}" || return 1
+	valid_prefix "${1#*/}" || return 1
+	return 0
+}
+
+valid_kbps() {
+	case "$1" in
+	''|*[!0-9]*) return 1 ;;
+	0) return 0 ;;
+	0*) return 1 ;;
+	esac
+	[ ${#1} -le 7 ] || return 1
+	[ "$1" -le "$MAX_KBPS" ] || return 1
+	return 0
+}
+
+valid_mac() {
+	case "$1" in
+	[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F])
+		return 0
+		;;
+	esac
+	return 1
+}
+
+norm_mac() {
+	valid_mac "$1" || return 1
+	printf '%s' "$1" | tr 'A-F' 'a-f'
+}
+
+# mask octet for a number of prefix bits (0..7)
+_mask_octet() {
+	case "$1" in
+	0) printf '0' ;;
+	1) printf '128' ;;
+	2) printf '192' ;;
+	3) printf '224' ;;
+	4) printf '240' ;;
+	5) printf '248' ;;
+	6) printf '252' ;;
+	7) printf '254' ;;
+	*) printf '255' ;;
+	esac
+}
+
+# network address for ip/prefix, e.g. 192.168.2.100/28 -> 192.168.2.96/28
+normalize_cidr() {
+	valid_cidr "$1" || return 1
+	_cip=${1%/*}
+	_cpfx=${1#*/}
+
+	_oldifs=$IFS
+	IFS=.
+	set -- $_cip
+	IFS=$_oldifs
+	_a1=$1 _a2=$2 _a3=$3 _a4=$4
+
+	_p=$_cpfx
+	_m1=$(_mask_octet "$_p"); _p=$((_p > 8 ? _p - 8 : 0))
+	_p2=$_p; _p=$((_p > 8 ? _p - 8 : 0))
+	_m2=$(_mask_octet "$_p2"); _p3=$_p; _p=$((_p > 8 ? _p - 8 : 0))
+	_m3=$(_mask_octet "$_p3"); _m4=$(_mask_octet "$_p")
+
+	printf '%s.%s.%s.%s/%s' \
+		"$((_a1 & _m1))" "$((_a2 & _m2))" "$((_a3 & _m3))" "$((_a4 & _m4))" "$_cpfx"
+}
+
+_octet_bits() {
+	_v=$1 _c=0 _i=0
+	while [ "$_i" -lt 8 ]; do
+		_c=$((_c + (_v % 2)))
+		_v=$((_v / 2))
+		_i=$((_i + 1))
+	done
+	printf '%s' "$_c"
+}
+
+netmask_prefix() {
+	valid_ipv4 "$1" || return 1
+	_oldifs=$IFS
+	IFS=.
+	set -- $1
+	IFS=$_oldifs
+	printf '%s' "$(( $(_octet_bits "$1") + $(_octet_bits "$2") + $(_octet_bits "$3") + $(_octet_bits "$4") ))"
+}
+
+rate_kb() {
+	# kbit/s -> KiB/s, ceil, because iptables "kb" is 1024 based and the kernel
+	# rejects a burst below one second of traffic.
+	_r=$(( ($1 * 125 + 1023) / 1024 ))
+	[ "$_r" -lt 1 ] && _r=1
+	printf '%s' "$_r"
+}
+
+burst_kb() {
+	# minimum burst accepted by libxt_hashlimit = one second of traffic
+	_b=$(( $1 + 2 ))
+	[ "$_b" -lt 1 ] && _b=1
+	printf '%s' "$_b"
+}
+
+ip_token() {
+	printf '%s' "$1" | tr '.' '_'
+}
+
+cidr_token() {
+	printf '%s' "$1" | tr './' '__'
+}
+
+mac_token() {
+	printf '%s' "$1" | tr 'A-F:' 'a-f_'
+}
+
+sanitize_label() {
+	# drop newlines / tabs / other ASCII control chars (keeps UTF-8 bytes)
+	printf '%s' "$1" | tr -d '\r\n\t' |
+		tr -d '\001-\010\013\014\016-\037\177'
+}
+
+label_length() {
+	_n=$(printf '%s' "$1" | wc -m 2>/dev/null | tr -d ' \n')
+	case "$_n" in
+	''|*[!0-9]*) _n=${#1} ;;
+	esac
+	printf '%s' "$_n"
+}
+
+json_escape() {
+	# escape a string for use inside a JSON string literal (UTF-8 kept as-is)
+	printf '%s' "$1" | awk '
+		BEGIN { ORS = "" }
+		{
+			out = ""
+			for (i = 1; i <= length($0); i++) {
+				c = substr($0, i, 1)
+				if (c == "\\")      { out = out "\\\\" }
+				else if (c == "\"") { out = out "\\\"" }
+				else if (c == "\t") { out = out "\\t" }
+				else if (c == "\n") { out = out "\\n" }
+				else if (c == "\r") { }
+				else                { out = out c }
+			}
+			printf "%s", out
+		}'
+}
+
+# ---------------------------------------------------------------------------
+# LAN / gateway detection and MAC -> IP resolution
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# LAN scope detection (v1.2)
+#
+# All limit rules are qualified with `-i <lan_dev>` (upload, mangle PREROUTING)
+# or `-o <lan_dev>` (download, mangle POSTROUTING).  This is mandatory on the
+# reference device: LAN is 10.0.0.0/8 while the WAN (wlan1, WiFi STA) is
+# 10.148.0.0/14 - a subset of the LAN range - so a bare CIDR match would also
+# throttle WAN upload/download traffic.
+#
+# Scope source: firewall zone name=lan -> network list -> UCI network device
+# (default br-<network>) -> IPv4 addresses from `ip -4 addr` (UCI ipaddr is the
+# fallback used by the unit tests / early boot).
+# ---------------------------------------------------------------------------
+
+ip_octets() {
+	_oldifs=$IFS
+	IFS=.
+	set -- $1
+	IFS=$_oldifs
+	printf '%s %s %s %s' "$1" "$2" "$3" "$4"
+}
+
+prefix_to_netmask() {
+	_p=$1
+	_m1=$(_mask_octet "$_p"); _p=$((_p > 8 ? _p - 8 : 0))
+	_p2=$_p; _p=$((_p > 8 ? _p - 8 : 0))
+	_m2=$(_mask_octet "$_p2")
+	_p3=$_p; _p=$((_p > 8 ? _p - 8 : 0))
+	_m3=$(_mask_octet "$_p3")
+	_m4=$(_mask_octet "$_p")
+	printf '%s.%s.%s.%s' "$_m1" "$_m2" "$_m3" "$_m4"
+}
+
+ip_in_cidr() {
+	# ip_in_cidr <ip> <cidr>
+	valid_ipv4 "$1" || return 1
+	_c=$(normalize_cidr "$2") || return 1
+	_net=${_c%/*}
+	_pfx=${_c#*/}
+	_mask=$(prefix_to_netmask "$_pfx")
+
+	set -- $(ip_octets "$1"); _a1=$1 _a2=$2 _a3=$3 _a4=$4
+	set -- $(ip_octets "$_net"); _n1=$1 _n2=$2 _n3=$3 _n4=$4
+	set -- $(ip_octets "$_mask"); _m1=$1 _m2=$2 _m3=$3 _m4=$4
+
+	[ $((_a1 & _m1)) -eq "$_n1" ] || return 1
+	[ $((_a2 & _m2)) -eq "$_n2" ] || return 1
+	[ $((_a3 & _m3)) -eq "$_n3" ] || return 1
+	[ $((_a4 & _m4)) -eq "$_n4" ] || return 1
+	return 0
+}
+
+cidr_within() {
+	# cidr_within <child> <parent>: child fully inside parent
+	_ch=$(normalize_cidr "$1") || return 1
+	_pa=$(normalize_cidr "$2") || return 1
+	_cp=${_ch#*/}
+	_pp=${_pa#*/}
+	[ "$_cp" -ge "$_pp" ] || return 1
+	ip_in_cidr "${_ch%/*}" "$_pa"
+}
+
+ip_add_int() {
+	# ip_add_int <ip> <n> -> ip+n (octet carry)
+	_n=$2
+	set -- $(ip_octets "$1")
+	_a1=$1 _a2=$2 _a3=$3 _a4=$4
+	_c=$_n
+	_v=$((_a4 + _c)); _a4=$((_v % 256)); _c=$((_v / 256))
+	_v=$((_a3 + _c)); _a3=$((_v % 256)); _c=$((_v / 256))
+	_v=$((_a2 + _c)); _a2=$((_v % 256)); _c=$((_v / 256))
+	_v=$((_a1 + _c)); _a1=$((_v % 256))
+	printf '%s.%s.%s.%s' "$_a1" "$_a2" "$_a3" "$_a4"
+}
+
+cidr_first() {
+	_c=$(normalize_cidr "$1") || return 1
+	printf '%s' "${_c%/*}"
+}
+
+cidr_last() {
+	_c=$(normalize_cidr "$1") || return 1
+	_net=${_c%/*}
+	_pfx=${_c#*/}
+	_mask=$(prefix_to_netmask "$_pfx")
+	set -- $(ip_octets "$_net"); _n1=$1 _n2=$2 _n3=$3 _n4=$4
+	set -- $(ip_octets "$_mask"); _m1=$1 _m2=$2 _m3=$3 _m4=$4
+	printf '%s.%s.%s.%s' \
+		"$((_n1 | (255 - _m1)))" "$((_n2 | (255 - _m2)))" \
+		"$((_n3 | (255 - _m3)))" "$((_n4 | (255 - _m4)))"
+}
+
+# ---------------------------------------------------------------------------
+# IPv4 range helpers (v1.3: batch rules match `start - end` via iprange)
+# ---------------------------------------------------------------------------
+
+ip_cmp() {
+	# ip_cmp <a> <b> -> -1 / 0 / 1 (octet-wise, no 32-bit shell arithmetic)
+	valid_ipv4 "$1" && valid_ipv4 "$2" || return 1
+	_ic_a=$(ip_octets "$1") || return 1
+	_ic_b=$(ip_octets "$2") || return 1
+	set -- $_ic_a; _ic_a1=$1 _ic_a2=$2 _ic_a3=$3 _ic_a4=$4
+	set -- $_ic_b; _ic_b1=$1 _ic_b2=$2 _ic_b3=$3 _ic_b4=$4
+
+	[ "$_ic_a1" -lt "$_ic_b1" ] && { printf -- '-1'; return 0; }
+	[ "$_ic_a1" -gt "$_ic_b1" ] && { printf '1'; return 0; }
+	[ "$_ic_a2" -lt "$_ic_b2" ] && { printf -- '-1'; return 0; }
+	[ "$_ic_a2" -gt "$_ic_b2" ] && { printf '1'; return 0; }
+	[ "$_ic_a3" -lt "$_ic_b3" ] && { printf -- '-1'; return 0; }
+	[ "$_ic_a3" -gt "$_ic_b3" ] && { printf '1'; return 0; }
+	[ "$_ic_a4" -lt "$_ic_b4" ] && { printf -- '-1'; return 0; }
+	[ "$_ic_a4" -gt "$_ic_b4" ] && { printf '1'; return 0; }
+	printf '0'
+}
+
+normalize_range() {
+	# normalize_range <"a-b"|"a - b"|cidr> -> "a-b"; fails on bad/reversed input
+	_nr=$(printf '%s' "$1" | sed -e 's/–/-/g' -e 's/—/-/g' | tr -d ' \t')
+	case "$_nr" in
+	*/*)
+		_nr_c=$(normalize_cidr "$_nr") || return 1
+		printf '%s-%s' "$(cidr_first "$_nr_c")" "$(cidr_last "$_nr_c")"
+		;;
+	*-*)
+		_nr_start=${_nr%%-*}
+		_nr_end=${_nr#*-}
+		valid_ipv4 "$_nr_start" && valid_ipv4 "$_nr_end" || return 1
+		case "$(ip_cmp "$_nr_start" "$_nr_end")" in
+		-1|0) printf '%s-%s' "$_nr_start" "$_nr_end" ;;
+		*) return 1 ;;
+		esac
+		;;
+	*) return 1 ;;
+	esac
+}
+
+ip_in_range() {
+	# ip_in_range <ip> <"a-b"|cidr>
+	valid_ipv4 "$1" || return 1
+	_ipr_r=$(normalize_range "$2") || return 1
+	_ipr_s=${_ipr_r%%-*}
+	_ipr_e=${_ipr_r#*-}
+	[ "$(ip_cmp "$1" "$_ipr_s")" = -1 ] && return 1
+	[ "$(ip_cmp "$1" "$_ipr_e")" = 1 ] && return 1
+	return 0
+}
+
+range_within() {
+	# range_within <child> <parent>: child fully inside parent
+	_rw_c=$(normalize_range "$1") || return 1
+	_rw_p=$(normalize_range "$2") || return 1
+	_rw_cs=${_rw_c%%-*}; _rw_ce=${_rw_c#*-}
+	_rw_ps=${_rw_p%%-*}; _rw_pe=${_rw_p#*-}
+	[ "$(ip_cmp "$_rw_cs" "$_rw_ps")" = -1 ] && return 1
+	[ "$(ip_cmp "$_rw_ce" "$_rw_pe")" = 1 ] && return 1
+	return 0
+}
+
+range_token() {
+	printf '%s' "$1" | tr '.-' '__'
+}
+
+group_range() {
+	# group_range <section> -> "start-end"
+	# v1.3.1 stores separate start/end fields (UI canonical); `range` and
+	# `cidr` are compatibility fallbacks for v1.3.0 / v1.2 configs.
+	_gr_sec=$1
+	_gr_s=$(uci_get "$_gr_sec.start")
+	_gr_e=$(uci_get "$_gr_sec.end")
+	if valid_ipv4 "$_gr_s" && valid_ipv4 "$_gr_e"; then
+		normalize_range "$_gr_s-$_gr_e" && return 0
+	fi
+	_gr_r=$(uci_get "$_gr_sec.range")
+	if [ -n "$_gr_r" ]; then
+		normalize_range "$_gr_r" && return 0
+	fi
+	_gr_c=$(uci_get "$_gr_sec.cidr")
+	[ -n "$_gr_c" ] || return 1
+	normalize_range "$_gr_c"
+}
+
+lan_devs_for_range() {
+	# lan_devs_for_range <"a-b"|cidr> -> one line per intersecting LAN subnet:
+	#   <dev>|<intersection-start>|<intersection-end>
+	# A range may span several LAN subnets/interfaces; each interface only sees
+	# the addresses that belong to it, so the intersected range is sufficient.
+	_ldr_r=$(normalize_range "$1") || return 1
+	_ldr_rs=${_ldr_r%%-*}
+	_ldr_re=${_ldr_r#*-}
+	while IFS='|' read -r _ldr_net _ldr_dev _ldr_lip _ldr_mask _ldr_cidr; do
+		[ -n "$_ldr_dev" ] && [ -n "$_ldr_cidr" ] || continue
+		_ldr_ns=$(cidr_first "$_ldr_cidr") || continue
+		_ldr_ne=$(cidr_last "$_ldr_cidr") || continue
+		_ldr_ss=$_ldr_rs
+		[ "$(ip_cmp "$_ldr_rs" "$_ldr_ns")" = -1 ] && _ldr_ss=$_ldr_ns
+		_ldr_ee=$_ldr_re
+		[ "$(ip_cmp "$_ldr_re" "$_ldr_ne")" = 1 ] && _ldr_ee=$_ldr_ne
+		[ "$(ip_cmp "$_ldr_ss" "$_ldr_ee")" = 1 ] && continue
+		printf '%s|%s|%s\n' "$_ldr_dev" "$_ldr_ss" "$_ldr_ee"
+	done <<EOF
+$(lan_scope_cached)
+EOF
+}
+
+lan_zone_networks() {
+	# Network names of the firewall zone name=lan (named or anonymous section).
+	if [ "$("$UCI" -q get firewall.lan 2>/dev/null)" = zone ]; then
+		_nets=$("$UCI" -q get firewall.lan.network 2>/dev/null)
+		[ -n "$_nets" ] && { printf '%s' "$_nets"; return 0; }
+		printf 'lan'
+		return 0
+	fi
+	_i=0
+	while [ "$_i" -lt 32 ]; do
+		_zname=$("$UCI" -q get "firewall.@zone[$_i].name" 2>/dev/null)
+		[ -n "$_zname" ] || break
+		if [ "$_zname" = lan ]; then
+			_nets=$("$UCI" -q get "firewall.@zone[$_i].network" 2>/dev/null)
+			[ -n "$_nets" ] || _nets=lan
+			printf '%s' "$_nets"
+			return 0
+		fi
+		_i=$((_i + 1))
+	done
+	# no firewall config at all (first boot): the conventional LAN network
+	printf 'lan'
+}
+
+lan_scope() {
+	# one line per LAN IPv4 address: network|device|ip|netmask|cidr
+	_nets=$(lan_zone_networks)
+	_ls_seen=' '
+	for _ls_net in $_nets; do
+		_ls_dev=$("$UCI" -q get "network.$_ls_net.device" 2>/dev/null)
+		if [ -z "$_ls_dev" ]; then
+			_ls_dev=$("$UCI" -q get "network.$_ls_net.ifname" 2>/dev/null)
+		fi
+		[ -n "$_ls_dev" ] || _ls_dev="br-$_ls_net"
+
+		_ls_n=0
+		_ls_addrs=''
+		if command -v ip >/dev/null 2>&1; then
+			_ls_addrs=$(ip -4 addr show dev "$_ls_dev" 2>/dev/null |
+				awk '$1 == "inet" { print $2 }')
+		fi
+		if [ -n "$_ls_addrs" ]; then
+			for _ls_a in $_ls_addrs; do
+				_ls_ip=${_ls_a%/*}
+				_ls_pfx=${_ls_a#*/}
+				valid_ipv4 "$_ls_ip" || continue
+				valid_prefix "$_ls_pfx" || continue
+				_ls_cidr=$(normalize_cidr "$_ls_ip/$_ls_pfx") || continue
+				_ls_mask=$(prefix_to_netmask "$_ls_pfx")
+				_ls_key="$_ls_dev|$_ls_cidr"
+				case "$_ls_seen" in *" $_ls_key "*) continue ;; esac
+				_ls_seen="$_ls_seen$_ls_key "
+				printf '%s|%s|%s|%s|%s\n' "$_ls_net" "$_ls_dev" "$_ls_ip" "$_ls_mask" "$_ls_cidr"
+				_ls_n=$((_ls_n + 1))
+			done
+		fi
+		if [ "$_ls_n" -eq 0 ]; then
+			# fallback for environments where the interface is not up yet
+			_ls_iplist=$("$UCI" -q get "network.$_ls_net.ipaddr" 2>/dev/null)
+			[ -n "$_ls_iplist" ] || _ls_iplist=$("$UCI" -q get "network.$_ls_net.ip4addr" 2>/dev/null)
+			_ls_mask=$("$UCI" -q get "network.$_ls_net.netmask" 2>/dev/null)
+			[ -n "$_ls_mask" ] || _ls_mask=255.255.255.0
+			_ls_pfx=$(netmask_prefix "$_ls_mask" 2>/dev/null)
+			case "$_ls_pfx" in ''|*[!0-9]*) _ls_pfx=24 ;; esac
+			for _ls_ip in $_ls_iplist; do
+				valid_ipv4 "$_ls_ip" || continue
+				_ls_cidr=$(normalize_cidr "$_ls_ip/$_ls_pfx") || continue
+				_ls_key="$_ls_dev|$_ls_cidr"
+				case "$_ls_seen" in *" $_ls_key "*) continue ;; esac
+				_ls_seen="$_ls_seen$_ls_key "
+				printf '%s|%s|%s|%s|%s\n' "$_ls_net" "$_ls_dev" "$_ls_ip" "$_ls_mask" "$_ls_cidr"
+			done
+		fi
+	done
+}
+
+LAN_SCOPE=''
+LSCOPE_READY=0
+
+refresh_lan_scope() {
+	LAN_SCOPE=$(lan_scope)
+	LSCOPE_READY=1
+}
+
+lan_scope_cached() {
+	if [ "$LSCOPE_READY" = 1 ]; then
+		[ -n "$LAN_SCOPE" ] && printf '%s\n' "$LAN_SCOPE"
+		return 0
+	fi
+	lan_scope
+}
+
+lan_devs_list() {
+	lan_scope_cached | awk -F'|' '{ if (!seen[$2]++) print $2 }'
+}
+
+lan_dev_for_ip() {
+	# most specific LAN interface containing the address
+	_ld_ip=$1
+	valid_ipv4 "$_ld_ip" || return 1
+	_ld_best=''
+	_ld_bp=-1
+	while IFS='|' read -r _ld_net _ld_dev _ld_lip _ld_mask _ld_cidr; do
+		[ -n "$_ld_dev" ] || continue
+		ip_in_cidr "$_ld_ip" "$_ld_cidr" || continue
+		_ld_p=${_ld_cidr#*/}
+		if [ "$_ld_p" -gt "$_ld_bp" ]; then
+			_ld_bp=$_ld_p
+			_ld_best=$_ld_dev
+		fi
+	done <<EOF
+$(lan_scope_cached)
+EOF
+	[ -n "$_ld_best" ] || return 1
+	printf '%s' "$_ld_best"
+}
+
+lan_dev_for_cidr() {
+	# most specific LAN interface whose subnet contains the CIDR.
+	# NOTE: ip_in_cidr()/cidr_within() use globals, so keep our state private.
+	_ldc_child=$(normalize_cidr "$1") || return 1
+	_ldc_best=''
+	_ldc_bp=-1
+	while IFS='|' read -r _ldc_net _ldc_dev _ldc_lip _ldc_mask _ldc_cidr; do
+		[ -n "$_ldc_dev" ] || continue
+		cidr_within "$_ldc_child" "$_ldc_cidr" || continue
+		_ldc_p=${_ldc_cidr#*/}
+		if [ "$_ldc_p" -gt "$_ldc_bp" ]; then
+			_ldc_bp=$_ldc_p
+			_ldc_best=$_ldc_dev
+		fi
+	done <<EOF
+$(lan_scope_cached)
+EOF
+	[ -n "$_ldc_best" ] || return 1
+	printf '%s' "$_ldc_best"
+}
+
+ip_in_lan() {
+	_il_ip=$1
+	valid_ipv4 "$_il_ip" || return 1
+	while IFS='|' read -r _il_net _il_dev _il_lip _il_mask _il_cidr; do
+		[ -n "$_il_cidr" ] || continue
+		ip_in_cidr "$_il_ip" "$_il_cidr" && return 0
+	done <<EOF
+$(lan_scope_cached)
+EOF
+	return 1
+}
+
+lan_ipaddrs() {
+	lan_scope_cached | awk -F'|' '!seen[$3]++ { print $3 }'
+}
+
+lan_first_ip() {
+	lan_scope_cached | awk -F'|' 'NR == 1 { print $3 }'
+}
+dhcp_host_pairs() {
+	# dhcp static hosts from /etc/config/dhcp: "<mac>\t<ip>\t<name>" lines.
+	# Real `uci show` output quotes values (dhcp.host_x.mac='aa:bb:...'), so the
+	# leading/trailing quote characters must be stripped before using them.
+	"$UCI" -q show dhcp 2>/dev/null | awk '
+		{
+			eq = index($0, "=")
+			if (eq == 0) next
+			key = substr($0, 1, eq - 1)
+			v = substr($0, eq + 1)
+			gsub(/^[\047"]+|[\047"]+$/, "", v)
+			if (key ~ /^dhcp\.[^.]+$/ && v == "host") { sec = key; next }
+			if (sec != "" && index(key, sec ".") == 1) {
+				k = substr(key, length(sec) + 2)
+				if (k == "mac") mac[sec] = v
+				else if (k == "ip") ip[sec] = v
+				else if (k == "name") nm[sec] = v
+				if (!(sec in seen)) { seen[sec] = 1; order[++n] = sec }
+			}
+		}
+		END {
+			for (i = 1; i <= n; i++) {
+				s = order[i]
+				if (mac[s] != "" && ip[s] != "")
+					printf "%s\t%s\t%s\n", tolower(mac[s]), ip[s], nm[s]
+			}
+		}'
+}
+
+resolve_mac() {
+	# resolve_mac <mac> -> current IPv4 (dhcp static -> leases -> arp)
+	_want=$(norm_mac "$1") || return 1
+
+	_r=$(dhcp_host_pairs | awk -F'\t' -v m="$_want" '
+		tolower($1) == m { print $2; exit }')
+	valid_ipv4 "$_r" && { printf '%s' "$_r"; return 0; }
+
+	if [ -f "$LEASES_FILE" ]; then
+		_r=$(awk -v m="$_want" '
+			tolower($2) == m { print $3; exit }' "$LEASES_FILE" 2>/dev/null)
+		valid_ipv4 "$_r" && { printf '%s' "$_r"; return 0; }
+	fi
+
+	if [ -f "$ARP_FILE" ]; then
+		_r=$(awk -v m="$_want" '
+			$1 ~ /^[0-9]+\./ && tolower($4) == m { print $1; exit }' "$ARP_FILE" 2>/dev/null)
+		valid_ipv4 "$_r" && { printf '%s' "$_r"; return 0; }
+	fi
+
+	return 1
+}
+
+_MAC_MATCH_CACHE=''
+mac_match_available() {
+	# Is the xt_mac match usable?
+	# The reference LEDE build has no /usr/lib/iptables/libxt_mac.so, but the
+	# extension is linked into the iptables binary / shipped by
+	# iptables-mod-extra, so probing `iptables -m mac --help` is authoritative.
+	# Priority: HLIMIT_MAC_MATCH override > extension lib file > iptables help.
+	case "${HLIMIT_MAC_MATCH:-}" in
+	1) return 0 ;;
+	0) return 1 ;;
+	esac
+	case "$_MAC_MATCH_CACHE" in
+	1) return 0 ;;
+	0) return 1 ;;
+	esac
+	for _d in "${HLIMIT_LIBXT_DIR:-}" /usr/lib/iptables /usr/lib/xtables \
+		/usr/lib/iptables/1.8.7 /usr/lib/xtables/1.8.7; do
+		[ -n "$_d" ] || continue
+		if [ -f "$_d/libxt_mac.so" ]; then
+			_MAC_MATCH_CACHE=1
+			return 0
+		fi
+	done
+	if "$IPT" -m mac --help 2>&1 | grep -q -- '--mac-source'; then
+		_MAC_MATCH_CACHE=1
+		return 0
+	fi
+	_MAC_MATCH_CACHE=0
+	return 1
+}
+
+# ---------------------------------------------------------------------------
+# iptables helpers (every call is explicit about its table)
+# ---------------------------------------------------------------------------
+
+chain_exists_t() {
+	"$IPT" -t "$1" -L "$2" -n >/dev/null 2>&1
+}
+
+ensure_chain_t() {
+	chain_exists_t "$1" "$2" && return 0
+	"$IPT" -t "$1" -N "$2" >/dev/null 2>&1
+	chain_exists_t "$1" "$2"
+}
+
+remove_jump_t() {
+	# remove_jump_t <table> <parent chain> <our chain>, -D exact match, loop
+	_n=0
+	while [ "$_n" -lt 32 ]; do
+		"$IPT" -t "$1" -C "$2" -j "$3" >/dev/null 2>&1 || break
+		"$IPT" -t "$1" -D "$2" -j "$3" >/dev/null 2>&1 || break
+		_n=$((_n + 1))
+	done
+}
+
+attach_jump_t() {
+	# attach_jump_t <table> <parent chain> <our chain>, -I 1, idempotent
+	"$IPT" -t "$1" -C "$2" -j "$3" >/dev/null 2>&1 && return 0
+	"$IPT" -t "$1" -I "$2" 1 -j "$3" >/dev/null 2>&1
+}
+
+_v1_filter_specs() {
+	# jumps left behind by v1.0 (filter table); always removed on render/flush
+	printf '%s\n' \
+		'FORWARD HLIMIT_UP' 'FORWARD HLIMIT_DOWN' \
+		'INPUT HLIMIT_UP' 'OUTPUT HLIMIT_DOWN'
+}
+
+flush_rules() {
+	# 1. drop the mangle jumps (idempotent, any number of stale copies)
+	remove_jump_t mangle PREROUTING "$CHAIN_UP"
+	remove_jump_t mangle POSTROUTING "$CHAIN_DOWN"
+
+	# 2. drop the stale v1.0 filter jumps (upgrade path)
+	while read -r _parent _chain; do
+		[ -n "$_parent" ] || continue
+		remove_jump_t filter "$_parent" "$_chain"
+	done <<EOF
+$(_v1_filter_specs)
+EOF
+
+	# 3. flush + delete our mangle chains
+	for _c in "$CHAIN_UP" "$CHAIN_DOWN"; do
+		"$IPT" -t mangle -F "$_c" >/dev/null 2>&1
+		"$IPT" -t mangle -X "$_c" >/dev/null 2>&1
+	done
+
+	# 4. flush + delete the chains v1.0 created in the filter table
+	for _c in "$CHAIN_UP" "$CHAIN_DOWN"; do
+		"$IPT" -t filter -F "$_c" >/dev/null 2>&1
+		"$IPT" -t filter -X "$_c" >/dev/null 2>&1
+	done
+	return 0
+}
+
+dev_token() {
+	# br-lan -> br_lan (safe inside a hashlimit name)
+	printf '%s' "$1" | tr '.:-' '___'
+}
+
+ipt_limit_rule() {
+	# ipt_limit_rule <chain> <up|down> <ip|mac|cidr|range|any> <value> <rate_kb> <burst_kb> <name> <dev>
+	# up   -> -i <dev> [-s <value> | -m mac --mac-source <value> | -m iprange --src-range <value>]
+	# down -> -o <dev> [-d <value> | -m iprange --dst-range <value>]
+	_c=$1 _dir=$2 _mt=$3 _mv=$4 _rate=$5 _burst=$6 _name=$7 _dev=$8
+	if [ "$_dir" = down ]; then
+		if [ "$_mt" = any ]; then
+			"$IPT" -t mangle -A "$_c" -o "$_dev" -m hashlimit \
+				--hashlimit-name "$_name" \
+				--hashlimit-mode dstip \
+				--hashlimit-above "${_rate}kb/s" \
+				--hashlimit-burst "${_burst}kb" \
+				-j DROP
+		elif [ "$_mt" = range ]; then
+			"$IPT" -t mangle -A "$_c" -o "$_dev" -m iprange --dst-range "$_mv" -m hashlimit \
+				--hashlimit-name "$_name" \
+				--hashlimit-mode dstip \
+				--hashlimit-above "${_rate}kb/s" \
+				--hashlimit-burst "${_burst}kb" \
+				-j DROP
+		else
+			"$IPT" -t mangle -A "$_c" -o "$_dev" -d "$_mv" -m hashlimit \
+				--hashlimit-name "$_name" \
+				--hashlimit-mode dstip \
+				--hashlimit-above "${_rate}kb/s" \
+				--hashlimit-burst "${_burst}kb" \
+				-j DROP
+		fi
+		return $?
+	fi
+
+	case "$_mt" in
+	mac) _match="-m mac --mac-source $_mv" ;;
+	range) _match="-m iprange --src-range $_mv" ;;
+	any) _match='' ;;
+	*) _match="-s $_mv" ;;
+	esac
+	# shellcheck disable=SC2086
+	"$IPT" -t mangle -A "$_c" -i "$_dev" $_match -m hashlimit \
+		--hashlimit-name "$_name" \
+		--hashlimit-mode srcip \
+		--hashlimit-above "${_rate}kb/s" \
+		--hashlimit-burst "${_burst}kb" \
+		-j DROP
+}
+
+add_limit_rule() {
+	# add_limit_rule <chain> <up|down> <ip|mac|cidr|any> <value> <kbps> <name> <dev>
+	_c=$1 _dir=$2 _mt=$3 _mv=$4 _kbps=$5 _name=$6 _dev=$7
+	_rate=$(rate_kb "$_kbps")
+	_burst=$(burst_kb "$_rate")
+	_errfile="/tmp/hlimit-ipt.$$.err"
+
+	if ipt_limit_rule "$_c" "$_dir" "$_mt" "$_mv" "$_rate" "$_burst" "$_name" "$_dev" 2>"$_errfile"; then
+		rm -f "$_errfile"
+		return 0
+	fi
+
+	# Some libxt_hashlimit builds require a burst bigger than our 1s estimate
+	# (high rates need extra byte-rounding headroom), while old builds enforce
+	# the historical 1MiB floor.  Retry with 2x rate, then with 1MiB.
+	if grep -q 'burst cannot be smaller' "$_errfile" 2>/dev/null; then
+		_b2=$(( _rate * 2 + 64 ))
+		log_warn "burst ${_burst}kb rejected for $_mv, retrying with ${_b2}kb"
+		if ipt_limit_rule "$_c" "$_dir" "$_mt" "$_mv" "$_rate" "$_b2" "$_name" "$_dev" 2>>"$_errfile"; then
+			rm -f "$_errfile"
+			return 0
+		fi
+		if grep -q 'burst cannot be smaller' "$_errfile" 2>/dev/null; then
+			log_warn "burst ${_b2}kb rejected for $_mv, retrying with 1024kb"
+			if ipt_limit_rule "$_c" "$_dir" "$_mt" "$_mv" "$_rate" 1024 "$_name" "$_dev" 2>>"$_errfile"; then
+				rm -f "$_errfile"
+				return 0
+			fi
+		fi
+	fi
+
+	rm -f "$_errfile"
+	return 1
+}
+
+add_return_rule() {
+	# add_return_rule <up|down> <ip|cidr|range|mac|any> <value> <dev>
+	# <dev> is empty for the gateway / end-of-chain RETURN rules.
+	_kind=$1 _mt=$2 _mv=$3 _dev=${4-}
+	if [ "$_kind" = down ]; then
+		if [ "$_mt" = any ]; then
+			if [ -n "$_dev" ]; then
+				"$IPT" -t mangle -A "$CHAIN_DOWN" -o "$_dev" -j RETURN
+			else
+				"$IPT" -t mangle -A "$CHAIN_DOWN" -j RETURN
+			fi
+		elif [ "$_mt" = range ]; then
+			if [ -n "$_dev" ]; then
+				"$IPT" -t mangle -A "$CHAIN_DOWN" -o "$_dev" -m iprange --dst-range "$_mv" -j RETURN
+			else
+				"$IPT" -t mangle -A "$CHAIN_DOWN" -m iprange --dst-range "$_mv" -j RETURN
+			fi
+		else
+			if [ -n "$_dev" ]; then
+				"$IPT" -t mangle -A "$CHAIN_DOWN" -o "$_dev" -d "$_mv" -j RETURN
+			else
+				"$IPT" -t mangle -A "$CHAIN_DOWN" -d "$_mv" -j RETURN
+			fi
+		fi
+		return $?
+	fi
+
+	case "$_mt" in
+	mac) _match="-m mac --mac-source $_mv" ;;
+	range) _match="-m iprange --src-range $_mv" ;;
+	any) _match='' ;;
+	*) _match="-s $_mv" ;;
+	esac
+	# shellcheck disable=SC2086
+	if [ -n "$_dev" ]; then
+		"$IPT" -t mangle -A "$CHAIN_UP" -i "$_dev" $_match -j RETURN
+	else
+		"$IPT" -t mangle -A "$CHAIN_UP" $_match -j RETURN
+	fi
+}
+
+chain_counters_match() {
+	# chain_counters_match <chain> <token> -> "<packets> <bytes>"
+	"$IPT" -t mangle -L "$1" -v -n -x 2>/dev/null | awk -v tok="$2" '
+		$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+			for (i = 3; i <= NF; i++) {
+				v = $i
+				sub(/\/32$/, "", v)
+				if (v == tok) { pkts += $1; bytes += $2; break }
+			}
+		}
+		END { printf "%d %d", pkts, bytes }'
+}
+
+chain_counters_by_name() {
+	# chain_counters_by_name <chain> <hashlimit-name> -> "<packets> <bytes>"
+	# `iptables -L` does not print the hashlimit name, so align the rule order
+	# of `-S` (which has the name) with `-L -v -x` (which has the counters).
+	_chain=$1
+	_name=$2
+	_idx=$("$IPT" -t mangle -S "$_chain" 2>/dev/null | awk -v n="--hashlimit-name $_name " '
+		/^-A / {
+			i++
+			if (index($0 " ", n) > 0) printf "%d ", i
+		}')
+	[ -n "$_idx" ] || { printf '0 0'; return 0; }
+	"$IPT" -t mangle -L "$_chain" -v -n -x 2>/dev/null | awk -v want=" $_idx " '
+		$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+			n++
+			if (index(want, " " n " ")) { pkts += $1; bytes += $2 }
+		}
+		END { printf "%d %d", pkts, bytes }'
+}
+# ---------------------------------------------------------------------------
+# LAN host data (static DHCP hosts + leases + ARP), hostnames, DHCP pool
+# ---------------------------------------------------------------------------
+
+_dns_parse() {
+	awk '
+		/^Name:[[:space:]]/ { print $2; exit }
+		/[[:space:]]name = / { print $NF; exit }'
+}
+
+reverse_name() {
+	# dnsmasq reverse lookup, best effort and strictly time boxed so that a
+	# slow/hijacked DNS (OpenClash) can never freeze the LuCI page.
+	#   HLIMIT_NO_DNS=1        disable
+	#   HLIMIT_DNS_TIMEOUT=N   seconds per lookup (default 1)
+	#   HLIMIT_NSLOOKUP=path   alternate resolver binary (tests)
+	[ "${HLIMIT_NO_DNS:-0}" = 1 ] && return 0
+	_ns=${HLIMIT_NSLOOKUP:-nslookup}
+	command -v "$_ns" >/dev/null 2>&1 || return 0
+	_tmo=${HLIMIT_DNS_TIMEOUT:-1}
+	case "$_tmo" in ''|*[!0-9]*) _tmo=1 ;; esac
+	[ "$_tmo" -gt 0 ] || return 0
+
+	_r=''
+	if command -v timeout >/dev/null 2>&1; then
+		_r=$(timeout "$_tmo" "$_ns" "$1" 2>/dev/null | _dns_parse)
+	else
+		# busybox without the timeout applet: background + bounded wait
+		_tmp="/tmp/hlimit-dns.$$"
+		( "$_ns" "$1" >"$_tmp" 2>/dev/null ) &
+		_pid=$!
+		if kill -0 "$_pid" 2>/dev/null; then
+			sleep "$_tmo"
+			kill -0 "$_pid" 2>/dev/null && kill "$_pid" 2>/dev/null
+		fi
+		wait "$_pid" 2>/dev/null
+		[ -f "$_tmp" ] && _r=$(_dns_parse <"$_tmp")
+		rm -f "$_tmp"
+	fi
+	[ -n "$_r" ] || return 0
+	_r=${_r%.}
+	_r=${_r%.lan}
+	printf '%s' "$_r"
+}
+
+_lan_hosts_merged() {
+	{
+		if [ -f "$LEASES_FILE" ]; then
+			awk 'NF >= 4 {
+				nm = ($4 == "*") ? "" : $4
+				printf "%s\t%s\t%s\tlease\t1\n", $3, tolower($2), nm
+			}' "$LEASES_FILE" 2>/dev/null
+		fi
+		dhcp_host_pairs | awk -F'\t' '{
+			printf "%s\t%s\t%s\tstatic\t0\n", $2, tolower($1), $3
+		}'
+		if [ -f "$ARP_FILE" ]; then
+			_devs=" $(lan_devs_list | tr '\n' ' ') "
+			while read -r _ip _hwtype _flags _mac _mask _dev _rest; do
+				case "$_ip" in
+				[0-9]*) ;;
+				*) continue ;;
+				esac
+				[ "$_flags" = "0x0" ] && continue   # FAILED ARP entry
+				case "$_devs" in *" $_dev "*) ;; *) continue ;; esac
+				printf '%s\t%s\t\tarp\t1\n' "$_ip" "$(printf '%s' "$_mac" | tr 'A-F' 'a-f')"
+			done <"$ARP_FILE"
+		fi
+	} | awk -F'\t' '
+		{
+			ip = $1; mac = $2; name = $3; src = $4; on = $5
+			if (ip == "" || mac == "") next
+			key = mac "|" ip
+			if (!(key in idx)) {
+				n++
+				idx[key] = n
+				O_ip[n] = ip; O_mac[n] = mac; O_name[n] = name
+				O_src[n] = src; O_on[n] = on
+				p = (src == "lease") ? 3 : ((src == "static") ? 2 : 1)
+				P[n] = p
+			} else {
+				i = idx[key]
+				if (O_name[i] == "" && name != "") O_name[i] = name
+				if (on == "1") O_on[i] = "1"
+				p = (src == "lease") ? 3 : ((src == "static") ? 2 : 1)
+				if (p > P[i]) { P[i] = p; O_src[i] = src }
+			}
+			if (on == "1") O_on[idx[key]] = "1"
+		}
+		END {
+			for (i = 1; i <= n; i++)
+				printf "%s|%s|%s|%s|%s\n", O_ip[i], O_mac[i], O_name[i], O_src[i], (O_on[i] == "1" ? "1" : "0")
+		}'
+}
+
+lan_hosts() {
+	# one line per LAN host: ip|mac|name|source|online
+	_merged=$(_lan_hosts_merged)
+	[ -n "$_merged" ] || return 0
+	printf '%s\n' "$_merged" | while IFS='|' read -r _ip _mac _name _src _on; do
+		ip_in_lan "$_ip" || continue
+		if [ -z "$_name" ]; then
+			_name=$(reverse_name "$_ip")
+		fi
+		printf '%s|%s|%s|%s|%s\n' "$_ip" "$_mac" "$_name" "$_src" "$_on"
+	done
+}
+
+lan_pool() {
+	# prints "<start> <end>" for the DHCP pool of the LAN network, if known
+	_pif=$("$UCI" -q get dhcp.lan.interface 2>/dev/null)
+	[ -n "$_pif" ] || _pif=lan
+	_start=$("$UCI" -q get dhcp.lan.start 2>/dev/null)
+	_limit=$("$UCI" -q get dhcp.lan.limit 2>/dev/null)
+	[ -n "$_start" ] || return 0
+	case "$_start" in *[!0-9]*) return 0 ;; esac
+	case "$_limit" in ''|*[!0-9]*) _limit=0 ;; esac
+
+	_base=''
+	while IFS='|' read -r _lp_net _lp_dev _lp_lip _lp_mask _lp_cidr; do
+		[ "$_lp_net" = "$_pif" ] || continue
+		_base=${_lp_cidr%/*}
+		break
+	done <<EOF
+$(lan_scope_cached)
+EOF
+	[ -n "$_base" ] || return 0
+
+	_sip=$(ip_add_int "$_base" "$_start")
+	_eip=$(ip_add_int "$_sip" "$((_limit > 0 ? _limit - 1 : 0))")
+	printf '%s %s' "$_sip" "$_eip"
+}
+
+device_resolution() {
+	# device_resolution <section> -> "<configured_ip>|<mac>|<resolved_ip>"
+	# resolved ip: MAC resolution when a MAC is configured, otherwise the
+	# configured IP (v1.2: no silent fallback from a MAC to a stale IP).
+	_ip=$(uci_get "$1.ip")
+	_mac=$(norm_mac "$(uci_get "$1.mac")")
+	_resolved=''
+	if [ -n "$_mac" ]; then
+		_resolved=$(resolve_mac "$_mac" 2>/dev/null || true)
+	else
+		_resolved=$_ip
+	fi
+	printf '%s|%s|%s' "$_ip" "$_mac" "$_resolved"
+}
+
+hostname_for() {
+	# hostname_for <ip> <mac> -> best available name, then IP, then MAC
+	_ip=$1
+	_mac=$(norm_mac "$2" 2>/dev/null || true)
+	_name=''
+	while IFS='|' read -r _hip _hmac _hname _src _on; do
+		if [ -n "$_mac" ] && [ "$_hmac" = "$_mac" ] && [ -n "$_hname" ]; then
+			_name=$_hname
+			break
+		fi
+		if [ -z "$_mac" ] && [ -n "$_ip" ] && [ "$_hip" = "$_ip" ] && [ -n "$_hname" ]; then
+			_name=$_hname
+			break
+		fi
+	done <<EOF
+$(lan_hosts)
+EOF
+	[ -n "$_name" ] || _name=$_ip
+	[ -n "$_name" ] || _name=$_mac
+	printf '%s' "$_name"
+}
+
+host_by_ip() {
+	# unique host with exactly this IP -> "ip|mac|name|..."
+	_hits=$(lan_hosts | awk -F'|' -v ip="$1" '$1 == ip { print }')
+	_n=$(printf '%s\n' "$_hits" | awk 'NF { c++ } END { print c + 0 }')
+	[ "$_n" = 1 ] || return 1
+	printf '%s' "$_hits"
+}
+
+host_by_name() {
+	# unique host whose name matches case-insensitively
+	_want=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+	[ -n "$_want" ] || return 1
+	_hits=$(lan_hosts | awk -F'|' -v w="$_want" 'tolower($3) == w { print }')
+	_n=$(printf '%s\n' "$_hits" | awk 'NF { c++ } END { print c + 0 }')
+	[ "$_n" = 1 ] || return 1
+	printf '%s' "$_hits"
+}
+
+host_by_last_octet() {
+	# unique host whose IPv4 last octet equals the given address' last octet
+	case "$1" in
+	*.*.*.*) ;;
+	*) return 1 ;;
+	esac
+	_last=${1##*.}
+	_hits=$(lan_hosts | awk -F'|' -v last="$_last" '
+		{ n = split($1, a, "."); if (a[4] == last) print }')
+	_n=$(printf '%s\n' "$_hits" | awk 'NF { c++ } END { print c + 0 }')
+	[ "$_n" = 1 ] || return 1
+	printf '%s' "$_hits"
+}
+
+is_valid_device_match() {
+	# enabled device that can produce at least one rule on some LAN interface
+	_r=$(device_resolution "$1")
+	_rest=${_r#*|}
+	_mac=${_rest%%|*}
+	_resolved=${_rest#*|}
+	if [ -n "$_mac" ]; then
+		mac_match_available && return 0
+		[ -n "$_resolved" ] && ip_in_lan "$_resolved" && return 0
+		return 1
+	fi
+	[ -n "$_resolved" ] || return 1
+	ip_in_lan "$_resolved"
+}
+# ---------------------------------------------------------------------------
+# offload (turboacc FLOWOFFLOAD) handling
+# ---------------------------------------------------------------------------
+
+fw_defaults_present() {
+	[ -n "$("$UCI" -q get 'firewall.@defaults[0]' 2>/dev/null)" ]
+}
+
+fw_get() { "$UCI" -q get "firewall.@defaults[0].$1" 2>/dev/null; }
+fw_set() { "$UCI" -q set "firewall.@defaults[0].$1=$2" >/dev/null 2>&1; }
+
+turboacc_present() {
+	[ -n "$("$UCI" -q get turboacc.config 2>/dev/null)" ]
+}
+
+turboacc_get() { "$UCI" -q get "turboacc.config.$1" 2>/dev/null; }
+turboacc_set() { "$UCI" -q set "turboacc.config.$1=$2" >/dev/null 2>&1; }
+
+backup_saved() {
+	[ "$(uci_get offload_backup.saved)" = 1 ]
+}
+
+offload_restart() {
+	# HLIMIT_IN_FW3=1 -> we are inside a fw3 reload triggered by the
+	# /etc/firewall.user hook: only change UCI, never restart recursively.
+	[ "${HLIMIT_IN_FW3:-0}" = 1 ] && return 0
+	if [ -x /etc/init.d/turboacc ]; then
+		/etc/init.d/turboacc restart >/dev/null 2>&1
+	elif [ -x /etc/init.d/firewall ]; then
+		/etc/init.d/firewall restart >/dev/null 2>&1
+	fi
+	return 0
+}
+
+has_active_limit() {
+	# any enabled device/group/default with a non-zero rate on some LAN iface?
+	[ "$(cfg_enabled)" = 1 ] || return 1
+	[ "$LSCOPE_READY" = 1 ] || refresh_lan_scope
+
+	for _sec in $(device_sections); do
+		_en=$(uci_get "$_sec.enabled"); [ -n "$_en" ] || _en=1
+		[ "$(norm_bool "$_en" 2>/dev/null)" = 1 ] || continue
+		[ "$(norm_kbps "$(uci_get "$_sec.down_kbps")")" -gt 0 ] || 			[ "$(norm_kbps "$(uci_get "$_sec.up_kbps")")" -gt 0 ] || continue
+		is_valid_device_match "$_sec" && return 0
+	done
+	for _sec in $(group_sections); do
+		_en=$(uci_get "$_sec.enabled"); [ -n "$_en" ] || _en=1
+		[ "$(norm_bool "$_en" 2>/dev/null)" = 1 ] || continue
+		[ "$(norm_kbps "$(uci_get "$_sec.down_kbps")")" -gt 0 ] || 			[ "$(norm_kbps "$(uci_get "$_sec.up_kbps")")" -gt 0 ] || continue
+		_cidr=$(group_range "$_sec") || continue
+		[ -n "$(lan_devs_for_range "$_cidr")" ] && return 0
+	done
+	if [ "$(default_enabled)" = 1 ]; then
+		[ "$(default_down_kbps)" -gt 0 ] || [ "$(default_up_kbps)" -gt 0 ] || return 1
+		[ -n "$(lan_scope_cached)" ] && return 0
+	fi
+	return 1
+}
+offload_active_value() {
+	# 1 if hardware/software flow offloading is currently active
+	_fo=$(fw_get flow_offloading); _fo=$(norm_bool "$_fo" 2>/dev/null) || _fo=0
+	[ "$_fo" = 1 ] && { printf '1'; return 0; }
+	if turboacc_present; then
+		_tf=$(turboacc_get fastpath)
+		[ -n "$_tf" ] && [ "$_tf" != disabled ] && { printf '1'; return 0; }
+	fi
+	printf '0'
+}
+
+offload_backup_save() {
+	backup_saved && return 0
+	_fo=$(fw_get flow_offloading); [ -n "$_fo" ] || _fo=0
+	_foh=$(fw_get flow_offloading_hw); [ -n "$_foh" ] || _foh=0
+	_tf=''
+	_tfh=''
+	if turboacc_present; then
+		_tf=$(turboacc_get fastpath)
+		_tfh=$(turboacc_get fastpath_fo_hw)
+	fi
+	"$UCI" -q set "$CONFIG.offload_backup=offload_backup" || return 1
+	"$UCI" -q set "$CONFIG.offload_backup.saved=1" || return 1
+	"$UCI" -q set "$CONFIG.offload_backup.firewall_fo=$_fo" || return 1
+	"$UCI" -q set "$CONFIG.offload_backup.firewall_fo_hw=$_foh" || return 1
+	"$UCI" -q set "$CONFIG.offload_backup.turboacc_fastpath=$_tf" || return 1
+	"$UCI" -q set "$CONFIG.offload_backup.turboacc_fo_hw=$_tfh" || return 1
+	return 0
+}
+
+offload_restore_body() {
+	backup_saved || return 0
+
+	_fo=$(uci_get offload_backup.firewall_fo)
+	_foh=$(uci_get offload_backup.firewall_fo_hw)
+	_tf=$(uci_get offload_backup.turboacc_fastpath)
+	_tfh=$(uci_get offload_backup.turboacc_fo_hw)
+
+	if fw_defaults_present; then
+		[ -n "$_fo" ] && fw_set flow_offloading "$_fo"
+		[ -n "$_foh" ] && fw_set flow_offloading_hw "$_foh"
+	fi
+	if turboacc_present; then
+		[ -n "$_tf" ] && turboacc_set fastpath "$_tf"
+		[ -n "$_tfh" ] && turboacc_set fastpath_fo_hw "$_tfh"
+	fi
+
+	"$UCI" -q commit >/dev/null 2>&1
+	"$UCI" -q delete "$CONFIG.offload_backup" >/dev/null 2>&1
+	"$UCI" -q commit >/dev/null 2>&1
+
+	offload_restart
+	return 0
+}
+
+offload_apply_body() {
+	# service globally off -> no rules are applied, give offloading back
+	if [ "$(cfg_enabled)" != 1 ]; then
+		backup_saved && offload_restore_body
+		return 0
+	fi
+
+	_auto=$(auto_disable_offload)
+
+	if [ "$_auto" != 1 ]; then
+		# user opted out: do not keep offloading disabled because of us
+		backup_saved && offload_restore_body
+		return 0
+	fi
+
+	if ! has_active_limit; then
+		# nothing is limited any more -> give the original settings back
+		backup_saved && offload_restore_body
+		return 0
+	fi
+
+	_changed=0
+	if ! backup_saved; then
+		offload_backup_save || return 3
+		_changed=1
+	fi
+
+	if fw_defaults_present; then
+		_fo=$(fw_get flow_offloading); [ -n "$_fo" ] || _fo=0
+		_foh=$(fw_get flow_offloading_hw); [ -n "$_foh" ] || _foh=0
+		[ "$_fo" = 0 ] || { fw_set flow_offloading 0; _changed=1; }
+		[ "$_foh" = 0 ] || { fw_set flow_offloading_hw 0; _changed=1; }
+	fi
+	if turboacc_present; then
+		_tf=$(turboacc_get fastpath)
+		if [ "$_tf" != disabled ]; then
+			turboacc_set fastpath disabled
+			_changed=1
+		fi
+	fi
+
+	if [ "$_changed" = 1 ]; then
+		"$UCI" -q commit >/dev/null 2>&1 || return 3
+		offload_restart
+	fi
+	return 0
+}
+
+offload_lock_acquire() {
+	_i=0
+	while [ "$_i" -lt 5 ]; do
+		mkdir "$OFFLOAD_LOCK" 2>/dev/null && return 0
+		sleep 1
+		_i=$((_i + 1))
+	done
+	return 1
+}
+
+offload_unlock() { rmdir "$OFFLOAD_LOCK" 2>/dev/null || true; }
+
+cmd_offload_apply() {
+	offload_lock_acquire || die 3 "offload: another instance is busy ($OFFLOAD_LOCK)"
+	offload_apply_body
+	_rc=$?
+	offload_unlock
+	return "$_rc"
+}
+
+cmd_offload_restore() {
+	offload_lock_acquire || die 3 "offload: another instance is busy ($OFFLOAD_LOCK)"
+	offload_restore_body
+	_rc=$?
+	offload_unlock
+	return "$_rc"
+}
+
+cmd_offload_status() {
+	_fo=$(fw_get flow_offloading); _fo=$(norm_bool "$_fo" 2>/dev/null) || _fo=0
+	_foh=$(fw_get flow_offloading_hw); _foh=$(norm_bool "$_foh" 2>/dev/null) || _foh=0
+	_tcp=0
+	_tf=''
+	if turboacc_present; then
+		_tcp=1
+		_tf=$(turboacc_get fastpath)
+	fi
+	_bs=0
+	backup_saved && _bs=1
+	printf '{"offload_active":"%s","firewall_fo":"%s","firewall_fo_hw":"%s","turboacc_fastpath":"%s","turboacc_present":"%s","backup_saved":"%s","auto_disable":"%s"}\n' \
+		"$(offload_active_value)" "$_fo" "$_foh" "$(json_escape "$_tf")" \
+		"$_tcp" "$_bs" "$(auto_disable_offload)"
+}
+
+# ---------------------------------------------------------------------------
+# render
+# ---------------------------------------------------------------------------
+
+render_gateway_returns() {
+	# UP: -d <lan_ip> -j RETURN.  This protects the router itself (LuCI/DNS)
+	# when clients connect TO it - it is still a client upload, but it must not
+	# be throttled by mistake.
+	#
+	# DOWN: NO gateway exemption.  With OpenClash fake-ip + REDIRECT, proxy
+	# replies are sent by a local socket with src = the router LAN IP
+	# (e.g. 10.0.0.1:7892 -> client), so a `-s <lan_ip> -j RETURN` at the top
+	# of HLIMIT_DOWN would let every proxy download bypass all download limits
+	# (real-world bug: device limit 5 Mbps, 10.4 MB matched the exemption and
+	# the device DROP rule counted 0 packets).  Router-originated replies to a
+	# LAN client are normal client download traffic and must be policed by the
+	# `-o <lan_dev> -d <client>` rules below.
+	_rc=0
+	while read -r _lip; do
+		[ -n "$_lip" ] || continue
+		"$IPT" -t mangle -A "$CHAIN_UP" -d "$_lip" -j RETURN || _rc=3
+	done <<EOF
+$(lan_ipaddrs)
+EOF
+	return "$_rc"
+}
+
+render_devices() {
+	_drc=0
+	for _sec in $(device_sections); do
+		_en=$(uci_get "$_sec.enabled"); [ -n "$_en" ] || _en=1
+		# v1.2: a disabled device produces no rules at all; use down=0/up=0
+		# (enabled) to exempt a device from the group/default limits.
+		[ "$(norm_bool "$_en" 2>/dev/null)" = 1 ] || continue
+
+		_resline=$(device_resolution "$_sec")
+		_cip=${_resline%%|*}
+		_rest=${_resline#*|}
+		_mac=${_rest%%|*}
+		_resolved=${_rest#*|}
+
+		_mac_ok=0
+		if [ -n "$_mac" ] && mac_match_available; then
+			_mac_ok=1
+		fi
+
+		_up_devs=''
+		_down_dev=''
+		_up_mt=''
+		_up_mv=''
+		_token=''
+
+		if [ -n "$_mac" ]; then
+			if [ -n "$_resolved" ] && ip_in_lan "$_resolved"; then
+				_down_dev=$(lan_dev_for_ip "$_resolved")
+				_up_devs=$_down_dev
+			elif [ "$_mac_ok" = 1 ]; then
+				# MAC known but no current IP: still limit upload on every LAN
+				# interface (MAC matching is interface independent).
+				_up_devs=$(lan_devs_list)
+				log_warn "device '$_sec': mac $_mac not resolved yet, upload-only rules"
+			else
+				log_warn "device '$_sec': mac $_mac not resolved and xt_mac unusable, skipped"
+				continue
+			fi
+			if [ "$_mac_ok" = 1 ]; then
+				_up_mt=mac
+				_up_mv=$_mac
+				_token=$(mac_token "$_mac")
+			else
+				_up_mt=ip
+				_up_mv=$_resolved
+				_token=$(ip_token "$_resolved")
+			fi
+		else
+			if ! valid_ipv4 "$_cip" || ! ip_in_lan "$_cip"; then
+				log_warn "device '$_sec': ip '$_cip' is not inside any LAN subnet, skipped"
+				continue
+			fi
+			_resolved=$_cip
+			_down_dev=$(lan_dev_for_ip "$_cip")
+			_up_devs=$_down_dev
+			_up_mt=ip
+			_up_mv=$_cip
+			_token=$(ip_token "$_cip")
+		fi
+
+		[ -n "$_up_devs" ] || continue
+
+		_dn=$(uci_get "$_sec.down_kbps"); [ -n "$_dn" ] || _dn=0
+		valid_kbps "$_dn" || { log_warn "section '$_sec': invalid down_kbps '$_dn', skipped"; _dn=0; _drc=3; }
+		_up=$(uci_get "$_sec.up_kbps"); [ -n "$_up" ] || _up=0
+		valid_kbps "$_up" || { log_warn "section '$_sec': invalid up_kbps '$_up', skipped"; _up=0; _drc=3; }
+
+		if [ "$_up" -gt 0 ]; then
+			for _d in $_up_devs; do
+				add_limit_rule "$CHAIN_UP" up "$_up_mt" "$_up_mv" "$_up" \
+					"hl_up_$(dev_token "$_d")_$_token" "$_d" ||
+					{ log_warn "failed to add upload rule for $_up_mv on $_d"; _drc=3; }
+			done
+		fi
+		if [ "$_dn" -gt 0 ] && [ -n "$_down_dev" ] && [ -n "$_resolved" ]; then
+			add_limit_rule "$CHAIN_DOWN" down ip "$_resolved" "$_dn" \
+				"hl_down_$(dev_token "$_down_dev")_$(ip_token "$_resolved")" "$_down_dev" ||
+				{ log_warn "failed to add download rule for $_resolved"; _drc=3; }
+		fi
+
+		# highest priority match: 0/0 (or disabled direction) = unlimited,
+		# but it must never fall through to a group or to the default limit.
+		for _d in $_up_devs; do
+			add_return_rule up "$_up_mt" "$_up_mv" "$_d" 2>/dev/null ||
+				{ log_warn "failed to add upload RETURN for $_up_mv"; _drc=3; }
+		done
+		if [ -n "$_down_dev" ] && [ -n "$_resolved" ]; then
+			add_return_rule down ip "$_resolved" "$_down_dev" 2>/dev/null ||
+				{ log_warn "failed to add download RETURN for $_resolved"; _drc=3; }
+		fi
+	done
+	return "$_drc"
+}
+
+render_group_excludes() {
+	# render_group_excludes <section> <lan_dev> <range> <up_kbps|-> <down_kbps|->
+	_sec=$1 _dev=$2 _range=$3
+	_up=$4 _dn=$5
+	_erc=0
+
+	for _ex in $(uci_get "$_sec.exclude"); do
+		[ -n "$_ex" ] || continue
+		if valid_ipv4 "$_ex"; then
+			if ! ip_in_range "$_ex" "$_range"; then
+				log_warn "group '$_sec': exclude '$_ex' is outside $_range, skipped"
+				continue
+			fi
+			[ "$_up" -gt 0 ] && add_return_rule up ip "$_ex" "$_dev"
+			[ "$_dn" -gt 0 ] && add_return_rule down ip "$_ex" "$_dev"
+			continue
+		fi
+		if valid_mac "$_ex"; then
+			_exmac=$(norm_mac "$_ex")
+			if [ "$_up" -gt 0 ]; then
+				if mac_match_available; then
+					add_return_rule up mac "$_exmac" "$_dev" ||
+						{ log_warn "group '$_sec': failed to add MAC exclude $_exmac"; _erc=3; }
+				else
+					_exip=$(resolve_mac "$_exmac" 2>/dev/null || true)
+					if [ -n "$_exip" ] && ip_in_lan "$_exip"; then
+						add_return_rule up ip "$_exip" "$_dev"
+					else
+						log_warn "group '$_sec': exclude mac $_exmac not resolved, skipped"
+					fi
+				fi
+			fi
+			if [ "$_dn" -gt 0 ]; then
+				_exip=$(resolve_mac "$_exmac" 2>/dev/null || true)
+				if [ -n "$_exip" ] && ip_in_lan "$_exip"; then
+					add_return_rule down ip "$_exip" "$_dev"
+				else
+					log_warn "group '$_sec': exclude mac $_exmac not resolved, download skip"
+				fi
+			fi
+			continue
+		fi
+		_exr=$(normalize_range "$_ex" 2>/dev/null || true)
+		if [ -n "$_exr" ]; then
+			if ! range_within "$_exr" "$_range"; then
+				log_warn "group '$_sec': exclude range '$_ex' is outside $_range, skipped"
+				continue
+			fi
+			[ "$_up" -gt 0 ] && add_return_rule up range "$_exr" "$_dev"
+			[ "$_dn" -gt 0 ] && add_return_rule down range "$_exr" "$_dev"
+			continue
+		fi
+		log_warn "group '$_sec': invalid exclude value '$_ex', skipped"
+	done
+	return "$_erc"
+}
+
+render_groups() {
+	_grc=0
+	_i=0
+	for _sec in $(group_sections); do
+		_en=$(uci_get "$_sec.enabled"); [ -n "$_en" ] || _en=1
+		[ "$(norm_bool "$_en" 2>/dev/null)" = 1 ] || continue
+
+		_range=$(group_range "$_sec") || {
+			log_warn "group '$_sec': invalid IP range, skipped"
+			continue
+		}
+		_grp_devs=$(lan_devs_for_range "$_range")
+		[ -n "$_grp_devs" ] || {
+			log_warn "group '$_sec': range $_range is not inside any LAN subnet, skipped"
+			continue
+		}
+		_i=$((_i + 1))
+
+		_dn=$(uci_get "$_sec.down_kbps"); [ -n "$_dn" ] || _dn=0
+		valid_kbps "$_dn" || { log_warn "group '$_sec': invalid down_kbps '$_dn', skipped"; _dn=0; _grc=3; }
+		_up=$(uci_get "$_sec.up_kbps"); [ -n "$_up" ] || _up=0
+		valid_kbps "$_up" || { log_warn "group '$_sec': invalid up_kbps '$_up', skipped"; _up=0; _grc=3; }
+
+		# whitelist RETURN rules: one set per involved LAN interface
+		for _gd in $(printf '%s\n' "$_grp_devs" | cut -d'|' -f1 | awk '!seen[$0]++'); do
+			render_group_excludes "$_sec" "$_gd" "$_range" "$_up" "$_dn"
+			[ $? -ne 0 ] && _grc=3
+		done
+
+		while IFS='|' read -r _gd _gs _ge; do
+			[ -n "$_gd" ] || continue
+			_sub="$_gs-$_ge"
+			if [ "$_up" -gt 0 ]; then
+				add_limit_rule "$CHAIN_UP" up range "$_sub" "$_up" \
+					"hl_up_grp_$(dev_token "$_gd")_$_i" "$_gd" ||
+					{ log_warn "failed to add upload rule for group $_range on $_gd"; _grc=3; }
+			fi
+			if [ "$_dn" -gt 0 ]; then
+				add_limit_rule "$CHAIN_DOWN" down range "$_sub" "$_dn" \
+					"hl_down_grp_$(dev_token "$_gd")_$_i" "$_gd" ||
+					{ log_warn "failed to add download rule for group $_range on $_gd"; _grc=3; }
+			fi
+			# a group is its own bucket: never fall through to the default limit
+			add_return_rule up range "$_sub" "$_gd" 2>/dev/null ||
+				{ log_warn "failed to add upload RETURN for group $_range"; _grc=3; }
+			add_return_rule down range "$_sub" "$_gd" 2>/dev/null ||
+				{ log_warn "failed to add download RETURN for group $_range"; _grc=3; }
+		done <<EOF
+$_grp_devs
+EOF
+	done
+	return "$_grc"
+}
+
+render_default() {
+	[ "$(default_enabled)" = 1 ] || return 0
+	_dn=$(default_down_kbps)
+	_up=$(default_up_kbps)
+	[ "$_dn" -gt 0 ] || [ "$_up" -gt 0 ] || return 0
+
+	if [ -z "$(lan_scope_cached)" ]; then
+		log_warn "default limit enabled but no LAN interface was detected; skipped"
+		return 0
+	fi
+
+	_frc=0
+	for _d in $(lan_devs_list); do
+		_token=$(dev_token "$_d")
+		if [ "$_up" -gt 0 ]; then
+			add_limit_rule "$CHAIN_UP" up any '' "$_up" "hl_up_def_$_token" "$_d" ||
+				{ log_warn "failed to add default upload rule on $_d"; _frc=3; }
+			add_return_rule up any '' "$_d" 2>/dev/null ||
+				{ log_warn "failed to add default upload RETURN on $_d"; _frc=3; }
+		fi
+		if [ "$_dn" -gt 0 ]; then
+			add_limit_rule "$CHAIN_DOWN" down any '' "$_dn" "hl_down_def_$_token" "$_d" ||
+				{ log_warn "failed to add default download rule on $_d"; _frc=3; }
+			add_return_rule down any '' "$_d" 2>/dev/null ||
+				{ log_warn "failed to add default download RETURN on $_d"; _frc=3; }
+		fi
+	done
+	return "$_frc"
+}
+
+cmd_render() {
+	command -v "$IPT" >/dev/null 2>&1 || die 3 "iptables ($IPT) not found"
+
+	if [ "$(cfg_enabled)" != 1 ]; then
+		# globally disabled: make sure nothing of ours is left behind
+		flush_rules
+		err "globally disabled, rules flushed"
+		return 0
+	fi
+
+	# start from a clean own-state; a failure here leaves the firewall usable
+	flush_rules
+
+	ensure_chain_t mangle "$CHAIN_UP" || die 3 "cannot create chain $CHAIN_UP in mangle"
+	ensure_chain_t mangle "$CHAIN_DOWN" || die 3 "cannot create chain $CHAIN_DOWN in mangle"
+
+	refresh_lan_scope
+
+	_rc=0
+	render_gateway_returns
+	[ $? -ne 0 ] && _rc=3
+	render_devices
+	[ $? -ne 0 ] && _rc=3
+	render_groups
+	[ $? -ne 0 ] && _rc=3
+	render_default
+	[ $? -ne 0 ] && _rc=3
+
+	# end of chain: whatever was not handled above is unlimited
+	add_return_rule up any '' '' || _rc=3
+	add_return_rule down any '' '' || _rc=3
+
+	# mangle PREROUTING runs before DNAT/OpenClash redirect; mangle POSTROUTING
+	# covers forwarded + local replies.  Interface qualified rules keep the
+	# overlapping WAN subnet out of the limiter.
+	attach_jump_t mangle PREROUTING "$CHAIN_UP" ||
+		{ log_warn "cannot jump mangle PREROUTING -> $CHAIN_UP"; _rc=3; }
+	attach_jump_t mangle POSTROUTING "$CHAIN_DOWN" ||
+		{ log_warn "cannot jump mangle POSTROUTING -> $CHAIN_DOWN"; _rc=3; }
+
+	# P1: never propagate our failure into fw3's own restart status
+	if [ "$_rc" -ne 0 ] && [ "${HLIMIT_IN_FW3:-0}" = 1 ]; then
+		return 0
+	fi
+	return "$_rc"
+}
+
+cmd_flush() {
+	flush_rules
+	return 0
+}
+# ---------------------------------------------------------------------------
+# JSON output
+# ---------------------------------------------------------------------------
+
+_json_kv_num() {
+	printf '"%s":%s' "$1" "$2"
+}
+
+_device_json() {
+	_sec=$1
+	_ip=$(uci_get "$_sec.ip")
+	_mac=$(norm_mac "$(uci_get "$_sec.mac")")
+	_resline=$(device_resolution "$_sec")
+	_resolved=${_resline#*|}
+	_resolved=${_resolved#*|}
+	_lbl=$(sanitize_label "$(uci_get "$_sec.label")")
+	_en=$(uci_get "$_sec.enabled"); [ -n "$_en" ] || _en=1
+	_en=$(norm_bool "$_en" 2>/dev/null) || _en=0
+	_dn=$(norm_kbps "$(uci_get "$_sec.down_kbps")")
+	_up=$(norm_kbps "$(uci_get "$_sec.up_kbps")")
+	_mode=$(uci_get "$_sec.mode"); [ -n "$_mode" ] || _mode=auto
+
+	_lan_dev=''
+	_in_lan=0
+	if [ -n "$_resolved" ] && ip_in_lan "$_resolved"; then
+		_in_lan=1
+		_lan_dev=$(lan_dev_for_ip "$_resolved" 2>/dev/null || true)
+	fi
+
+	_down_unresolved=0
+	if [ "$_en" = 1 ] && [ -n "$_mac" ] && [ -z "$_resolved" ]; then
+		_down_unresolved=1
+	fi
+
+	_down_match=''
+	_up_match=''
+	if [ -n "$_resolved" ]; then _down_match=$_resolved; fi
+	if [ -n "$_mac" ] && mac_match_available; then
+		_up_match=$_mac
+	elif [ -n "$_resolved" ]; then
+		_up_match=$_resolved
+	fi
+
+	_dpair='0 0'; _upair='0 0'
+	[ -n "$_down_match" ] && _dpair=$(chain_counters_match "$CHAIN_DOWN" "$_down_match")
+	[ -n "$_up_match" ] && _upair=$(chain_counters_match "$CHAIN_UP" "$_up_match")
+	_down_pkts=${_dpair%% *}; _down_bytes=${_dpair##* }
+	_up_pkts=${_upair%% *}; _up_bytes=${_upair##* }
+
+	printf '{"kind":"device","ip":"%s","mac":"%s","resolved_ip":"%s","lan_dev":"%s","in_lan":"%s","down_unresolved":"%s","label":"%s","enabled":"%s","down_kbps":"%s","up_kbps":"%s","mode":"%s",%s,%s,%s,%s}' \
+		"$(json_escape "$_ip")" "$(json_escape "$_mac")" \
+		"$(json_escape "$_resolved")" "$(json_escape "$_lan_dev")" "$_in_lan" \
+		"$_down_unresolved" \
+		"$(json_escape "$_lbl")" "$_en" "$_dn" "$_up" "$(json_escape "$_mode")" \
+		"$(_json_kv_num down_bytes "$_down_bytes")" \
+		"$(_json_kv_num up_bytes "$_up_bytes")" \
+		"$(_json_kv_num down_pkts "$_down_pkts")" \
+		"$(_json_kv_num up_pkts "$_up_pkts")"
+}
+
+_group_json() {
+	_sec=$1
+	_range=$(group_range "$_sec") || _range=''
+	_start=''
+	_end=''
+	if [ -n "$_range" ]; then
+		_start=${_range%%-*}
+		_end=${_range#*-}
+	fi
+	_lbl=$(sanitize_label "$(uci_get "$_sec.label")")
+	_en=$(uci_get "$_sec.enabled"); [ -n "$_en" ] || _en=1
+	_en=$(norm_bool "$_en" 2>/dev/null) || _en=0
+	_dn=$(norm_kbps "$(uci_get "$_sec.down_kbps")")
+	_up=$(norm_kbps "$(uci_get "$_sec.up_kbps")")
+
+	_lan_dev=''
+	_in_lan=0
+	if [ -n "$_range" ]; then
+		_lan_dev=$(lan_devs_for_range "$_range" 2>/dev/null | head -n 1 | cut -d'|' -f1)
+		[ -n "$_lan_dev" ] && _in_lan=1
+	fi
+
+	_dpair='0 0'; _upair='0 0'
+	[ "$_in_lan" = 1 ] && _dpair=$(chain_counters_match "$CHAIN_DOWN" "$_range")
+	[ "$_in_lan" = 1 ] && _upair=$(chain_counters_match "$CHAIN_UP" "$_range")
+	_down_pkts=${_dpair%% *}; _down_bytes=${_dpair##* }
+	_up_pkts=${_upair%% *}; _up_bytes=${_upair##* }
+
+	printf '{"kind":"group","cidr":"","range":"%s","start":"%s","end":"%s","label":"%s","enabled":"%s","down_kbps":"%s","up_kbps":"%s","lan_dev":"%s","in_lan":"%s","exclude":[' \
+		"$(json_escape "$_range")" "$(json_escape "$_start")" "$(json_escape "$_end")" \
+		"$(json_escape "$_lbl")" "$_en" "$_dn" "$_up" \
+		"$(json_escape "$_lan_dev")" "$_in_lan"
+	_exfirst=1
+	for _ex in $(uci_get "$_sec.exclude"); do
+		[ -n "$_ex" ] || continue
+		[ "$_exfirst" = 1 ] || printf ','
+		_exfirst=0
+		printf '"%s"' "$(json_escape "$_ex")"
+	done
+	printf '],%s,%s,%s,%s}' \
+		"$(_json_kv_num down_bytes "$_down_bytes")" \
+		"$(_json_kv_num up_bytes "$_up_bytes")" \
+		"$(_json_kv_num down_pkts "$_down_pkts")" \
+		"$(_json_kv_num up_pkts "$_up_pkts")"
+}
+
+_default_counters() {
+	_up_p=0; _up_b=0; _dn_p=0; _dn_b=0
+	for _d in $(lan_devs_list); do
+		_tok=$(dev_token "$_d")
+		_pair=$(chain_counters_by_name "$CHAIN_UP" "hl_up_def_$_tok")
+		_up_p=$((_up_p + ${_pair%% *})); _up_b=$((_up_b + ${_pair##* }))
+		_pair=$(chain_counters_by_name "$CHAIN_DOWN" "hl_down_def_$_tok")
+		_dn_p=$((_dn_p + ${_pair%% *})); _dn_b=$((_dn_b + ${_pair##* }))
+	done
+	printf '%s %s %s %s' "$_dn_p" "$_dn_b" "$_up_p" "$_up_b"
+}
+
+_default_json() {
+	_en=$(default_enabled)
+	_dn=$(default_down_kbps)
+	_up=$(default_up_kbps)
+	_c=$(_default_counters)
+	set -- $_c
+	_dn_p=${1:-0}; _dn_b=${2:-0}; _up_p=${3:-0}; _up_b=${4:-0}
+
+	printf '{"kind":"default","cidr":"","label":"默认限速","enabled":"%s","down_kbps":"%s","up_kbps":"%s","interfaces":[' \
+		"$_en" "$_dn" "$_up"
+	_first=1
+	for _d in $(lan_devs_list); do
+		[ "$_first" = 1 ] || printf ','
+		_first=0
+		printf '"%s"' "$(json_escape "$_d")"
+	done
+	printf '],%s,%s,%s,%s}' \
+		"$(_json_kv_num down_bytes "$_dn_b")" \
+		"$(_json_kv_num up_bytes "$_up_b")" \
+		"$(_json_kv_num down_pkts "$_dn_p")" \
+		"$(_json_kv_num up_pkts "$_up_p")"
+}
+
+_lan_json() {
+	printf '['
+	_first=1
+	while IFS='|' read -r _net _dev _lip _mask _cidr; do
+		[ -n "$_cidr" ] || continue
+		[ "$_first" = 1 ] || printf ','
+		_first=0
+		printf '{"network":"%s","device":"%s","ip":"%s","netmask":"%s","cidr":"%s"}' \
+			"$(json_escape "$_net")" "$(json_escape "$_dev")" \
+			"$(json_escape "$_lip")" "$(json_escape "$_mask")" \
+			"$(json_escape "$_cidr")"
+	done <<EOF
+$(lan_scope_cached)
+EOF
+	printf ']'
+}
+
+_defaults_json() {
+	printf '{"enabled":"%s","auto_disable_offload":"%s","default_enabled":"%s","default_down_kbps":"%s","default_up_kbps":"%s","scope":"all-lan","lan":%s,"gateway":"%s","default_cidr":"","effective_cidr":"","default_exclude":[]}' \
+		"$(cfg_enabled)" "$(auto_disable_offload)" "$(default_enabled)" \
+		"$(default_down_kbps)" "$(default_up_kbps)" \
+		"$(_lan_json)" "$(json_escape "$(lan_first_ip 2>/dev/null || true)")"
+}
+
+_warnings_list() {
+	# human readable warnings for the UI status area (one per line)
+	for _sec in $(device_sections); do
+		_en=$(uci_get "$_sec.enabled"); [ -n "$_en" ] || _en=1
+		[ "$(norm_bool "$_en" 2>/dev/null)" = 1 ] || continue
+		_lbl=$(sanitize_label "$(uci_get "$_sec.label")")
+		[ -n "$_lbl" ] || _lbl=$(uci_get "$_sec.ip")
+		_resline=$(device_resolution "$_sec")
+		_cip=${_resline%%|*}
+		_rest=${_resline#*|}
+		_mac=${_rest%%|*}
+		_resolved=${_rest#*|}
+		if [ -n "$_mac" ]; then
+			if [ -z "$_resolved" ]; then
+				printf '设备 %s：MAC %s 未解析，下行规则未生成\n' "$_lbl" "$_mac"
+			elif ! ip_in_lan "$_resolved"; then
+				printf '设备 %s：MAC 解析到 %s，不在 LAN 网段\n' "$_lbl" "$_resolved"
+			fi
+		else
+			if ! valid_ipv4 "$_cip" || ! ip_in_lan "$_cip"; then
+				printf '设备 %s：IP %s 不在 LAN 网段，规则不会生效\n' "$_lbl" "$_cip"
+			fi
+		fi
+	done
+	for _sec in $(group_sections); do
+		_en=$(uci_get "$_sec.enabled"); [ -n "$_en" ] || _en=1
+		[ "$(norm_bool "$_en" 2>/dev/null)" = 1 ] || continue
+		_range=$(group_range "$_sec") || {
+			printf '批量限速 %s：IP 区间无效，规则不会生效\n' "$_sec"
+			continue
+		}
+		if [ -z "$(lan_devs_for_range "$_range")" ]; then
+			printf '批量限速 %s：不在 LAN 网段，规则不会生效\n' "$_range"
+		fi
+	done
+	printf 'IPv6 未限速（当前无 IPv6 出口）\n'
+}
+
+_warnings_json() {
+	printf '['
+	_first=1
+	while IFS= read -r _w; do
+		[ -n "$_w" ] || continue
+		[ "$_first" = 1 ] || printf ','
+		_first=0
+		printf '"%s"' "$(json_escape "$_w")"
+	done <<EOF
+$(_warnings_list)
+EOF
+	printf ']'
+}
+
+print_json() {
+	_want_status=$1
+
+	printf '{"version":"%s","enabled":"%s"' "$VERSION" "$(cfg_enabled)"
+	if [ "$_want_status" = status ]; then
+		printf ',"offload":"%s","offload_active":"%s","backup_saved":"%s","auto_disable":"%s"' \
+			"$(offload_active_value)" "$(offload_active_value)" \
+			"$(backup_saved && printf 1 || printf 0)" "$(auto_disable_offload)"
+	fi
+
+	# unified devices[] (kind = device|group|default) + convenience subsets
+	printf ',"defaults":%s' "$(_defaults_json)"
+	printf ',"devices":['
+
+	_first=1
+	for _sec in $(device_sections); do
+		[ "$_first" = 1 ] || printf ','
+		_first=0
+		_device_json "$_sec"
+	done
+	for _sec in $(group_sections); do
+		[ "$_first" = 1 ] || printf ','
+		_first=0
+		_group_json "$_sec"
+	done
+	[ "$_first" = 1 ] || printf ','
+	_default_json
+
+	printf '],"groups":['
+	_first=1
+	for _sec in $(group_sections); do
+		[ "$_first" = 1 ] || printf ','
+		_first=0
+		_group_json "$_sec"
+	done
+	printf '],"default":%s' "$(_default_json)"
+	printf ',"warnings":%s' "$(_warnings_json)"
+	printf '}\n'
+}
+
+cmd_list() {
+	refresh_lan_scope
+	print_json list
+}
+
+cmd_status() {
+	refresh_lan_scope
+	print_json status
+}
+
+cmd_default_status() {
+	refresh_lan_scope
+	printf '{"enabled":"%s","defaults":%s,"warnings":%s}\n' \
+		"$(cfg_enabled)" "$(_defaults_json)" "$(_warnings_json)"
+}
+# ---------------------------------------------------------------------------
+# devices: LAN hosts only (static DHCP hosts + leases + reachable ARP)
+# ---------------------------------------------------------------------------
+
+cmd_devices() {
+	refresh_lan_scope
+	_hosts=$(lan_hosts)
+	_json=$(printf '%s\n' "$_hosts" | awk -F'|' '
+		function jesc(s,   out, i, c) {
+			out = ""
+			for (i = 1; i <= length(s); i++) {
+				c = substr(s, i, 1)
+				if (c == "\\")      out = out "\\\\"
+				else if (c == "\"") out = out "\\\""
+				else if (c == "\t") out = out "\\t"
+				else                out = out c
+			}
+			return out
+		}
+		BEGIN { n = 0 }
+		NF >= 5 {
+			n++
+			I[n] = $1; M[n] = $2; N[n] = $3; S[n] = $4; O[n] = $5
+		}
+		END {
+			printf "{\"devices\":["
+			for (i = 1; i <= n; i++) {
+				if (i > 1) printf ","
+				printf "{\"ip\":\"%s\",\"mac\":\"%s\",\"name\":\"%s\",\"source\":\"%s\",\"online\":\"%s\"}",
+					jesc(I[i]), jesc(M[i]), jesc(N[i]), jesc(S[i]), jesc(O[i])
+			}
+			printf "]}\n"
+		}')
+	case "$_json" in
+	'{"devices":'*) printf '%s\n' "$_json" ;;
+	*) printf '{"devices":[]}\n' ;;
+	esac
+}
+# ---------------------------------------------------------------------------
+# UCI write helpers
+# ---------------------------------------------------------------------------
+
+uci_commit_or_die() {
+	"$UCI" -q commit "$CONFIG" >/dev/null 2>&1 || die 3 "uci commit $CONFIG failed"
+}
+
+ensure_defaults_section() {
+	[ -n "$("$UCI" -q get "$CONFIG.defaults" 2>/dev/null)" ] && return 0
+	"$UCI" -q set "$CONFIG.defaults=defaults" >/dev/null 2>&1
+}
+
+apply_offload_then_render() {
+	_off_rc=0
+	cmd_offload_apply || _off_rc=$?
+	cmd_render
+	_rend_rc=$?
+	if [ "$_rend_rc" -ne 0 ]; then
+		die 3 "configuration saved, but applying iptables rules failed (see above)"
+	fi
+	if [ "$_off_rc" -ne 0 ]; then
+		die 3 "configuration saved, but offload handling failed (see above)"
+	fi
+	return 0
+}
+
+# resolve a user supplied "<ip|mac>" device key to a section name
+find_device_any() {
+	_key=$1
+	if valid_ipv4 "$_key"; then
+		find_section_by_ip "$_key" && return 0
+	fi
+	if valid_mac "$_key"; then
+		find_section_by_mac "$_key" && return 0
+	fi
+	return 1
+}
+
+cmd_set() {
+	[ $# -ge 3 ] || die 1 "usage: hlimit-ctl set <ip|-> <down_kbps> <up_kbps> [label] [enabled] [mac]"
+
+	_ip=$1
+	_dn=$2
+	_up=$3
+	_lbl=${4-}
+	_en=${5-}
+	_mac=${6-}
+
+	if [ "$_ip" = '-' ] || [ -z "$_ip" ]; then
+		_ip=''
+	elif ! valid_ipv4 "$_ip"; then
+		die 2 "invalid IPv4 address: '$_ip' (use '-' for a MAC-only device)"
+	fi
+	valid_kbps "$_dn" || die 2 "invalid down_kbps: '$_dn' (0..$MAX_KBPS)"
+	valid_kbps "$_up" || die 2 "invalid up_kbps: '$_up' (0..$MAX_KBPS)"
+	if [ -n "$_mac" ]; then
+		_mac=$(norm_mac "$_mac") || die 2 "invalid MAC address: '$6'"
+	fi
+	[ -n "$_ip" ] || [ -n "$_mac" ] || die 2 "either an IPv4 address or a MAC address is required"
+
+	_existing=''
+	if [ -n "$_mac" ]; then
+		_existing=$(find_section_by_mac "$_mac") || _existing=''
+	fi
+	if [ -z "$_existing" ] && [ -n "$_ip" ]; then
+		_existing=$(find_section_by_ip "$_ip") || _existing=''
+	fi
+
+	_lbl_given=0
+	[ $# -ge 4 ] && _lbl_given=1
+	_lbl=$(sanitize_label "$_lbl")
+	_auto=0
+	if [ "$_lbl_given" = 1 ]; then
+		case "$_lbl" in
+		''|-) _auto=1 ;;
+		esac
+	fi
+	if [ "$_auto" = 1 ] || { [ "$_lbl_given" = 0 ] && [ -z "$_existing" ]; }; then
+		# v1.2: empty label -> current hostname of the device (then IP/MAC)
+		refresh_lan_scope
+		_lbl=$(sanitize_label "$(hostname_for "$_ip" "$_mac")")
+	elif [ "$_lbl_given" = 0 ] && [ -n "$_existing" ]; then
+		# update without a label argument: keep the stored label
+		_lbl=$(sanitize_label "$(uci_get "$_existing.label")")
+		if [ -z "$_lbl" ]; then
+			refresh_lan_scope
+			_lbl=$(sanitize_label "$(hostname_for "$_ip" "$_mac")")
+		fi
+	fi
+	[ "$(label_length "$_lbl")" -le "$MAX_LABEL" ] ||
+		die 2 "label too long (max $MAX_LABEL characters)"
+
+	if [ -n "$_existing" ]; then
+		_sec=$_existing
+	else
+		if [ -n "$_ip" ]; then
+			_sec="dev_$(ip_token "$_ip")"
+		else
+			_sec="dev_mac_$(mac_token "$_mac")"
+		fi
+	fi
+
+	if [ -n "$_en" ]; then
+		_en=$(norm_bool "$_en") || die 2 "invalid enabled flag: '$_en' (expect 0 or 1)"
+	elif [ -n "$_existing" ]; then
+		_en=$(uci_get "$_sec.enabled")
+		[ -n "$_en" ] || _en=1
+	else
+		_en=1
+	fi
+
+	if ! "$UCI" -q set "$CONFIG.$_sec=device" >/dev/null 2>&1; then
+		die 3 "cannot create/update section $CONFIG.$_sec"
+	fi
+	if [ -n "$_ip" ]; then
+		"$UCI" -q set "$CONFIG.$_sec.ip=$_ip" >/dev/null 2>&1 || die 3 "uci set ip failed"
+	else
+		"$UCI" -q delete "$CONFIG.$_sec.ip" >/dev/null 2>&1
+	fi
+	if [ -n "$_mac" ]; then
+		"$UCI" -q set "$CONFIG.$_sec.mac=$_mac" >/dev/null 2>&1 || die 3 "uci set mac failed"
+	fi
+	"$UCI" -q set "$CONFIG.$_sec.down_kbps=$_dn" >/dev/null 2>&1 || die 3 "uci set down_kbps failed"
+	"$UCI" -q set "$CONFIG.$_sec.up_kbps=$_up" >/dev/null 2>&1 || die 3 "uci set up_kbps failed"
+	"$UCI" -q set "$CONFIG.$_sec.label=$_lbl" >/dev/null 2>&1 || die 3 "uci set label failed"
+	"$UCI" -q set "$CONFIG.$_sec.enabled=$_en" >/dev/null 2>&1 || die 3 "uci set enabled failed"
+
+	uci_commit_or_die
+	apply_offload_then_render
+	return 0
+}
+
+cmd_delete() {
+	[ $# -eq 1 ] || die 1 "usage: hlimit-ctl delete <ip|mac>"
+	_key=$1
+	_sec=$(find_device_any "$_key") || _sec=''
+	if [ -z "$_sec" ]; then
+		err "device not found: $_key (nothing to do)"
+		return 0
+	fi
+
+	"$UCI" -q delete "$CONFIG.$_sec" >/dev/null 2>&1 || die 3 "uci delete $CONFIG.$_sec failed"
+	uci_commit_or_die
+	apply_offload_then_render
+	return 0
+}
+
+cmd_toggle() {
+	[ $# -eq 2 ] || die 1 "usage: hlimit-ctl toggle <ip|mac> <0|1>"
+	_key=$1
+	_en=$2
+	case "$_en" in 0|1) ;; *) die 2 "invalid enabled flag: '$_en' (expect 0 or 1)" ;; esac
+
+	_sec=$(find_device_any "$_key") || _sec=''
+	[ -n "$_sec" ] || die 2 "device not found: $_key"
+
+	"$UCI" -q set "$CONFIG.$_sec.enabled=$_en" >/dev/null 2>&1 || die 3 "uci set enabled failed"
+	uci_commit_or_die
+	apply_offload_then_render
+	return 0
+}
+
+cmd_global() {
+	[ $# -eq 1 ] || die 1 "usage: hlimit-ctl global <0|1>"
+	case "$1" in 0|1) ;; *) die 2 "invalid enabled flag: '$1' (expect 0 or 1)" ;; esac
+
+	ensure_defaults_section
+	if ! "$UCI" -q set "$CONFIG.defaults.enabled=$1" >/dev/null 2>&1; then
+		die 3 "uci set enabled failed"
+	fi
+	uci_commit_or_die
+	apply_offload_then_render
+	return 0
+}
+
+cmd_group_set() {
+	# v1.3:      group-set <start> <end> <down_kbps> <up_kbps> [label] [enabled]
+	# v1.2 form: group-set <range|cidr> <down_kbps> <up_kbps> [label] [enabled]
+	if [ $# -ge 4 ] && valid_ipv4 "$1" && valid_ipv4 "$2"; then
+		_range=$(normalize_range "$1-$2") ||
+			die 2 "invalid IP range: '$1-$2' (start must not be greater than end)"
+		_dn=$3
+		_up=$4
+		_lbl=${5-}
+		_en=${6-}
+	else
+		[ $# -ge 3 ] ||
+			die 1 "usage: hlimit-ctl group-set <start> <end> <down_kbps> <up_kbps> [label] [enabled]"
+		_range=$(normalize_range "$1") ||
+			die 2 "invalid IP range: '$1' (example: 10.0.1.1-10.0.2.1, 10.0.1.0/24)"
+		_dn=$2
+		_up=$3
+		_lbl=${4-}
+		_en=${5-}
+	fi
+	_start=${_range%%-*}
+	_end=${_range#*-}
+
+	valid_kbps "$_dn" || die 2 "invalid down_kbps: '$_dn' (0..$MAX_KBPS)"
+	valid_kbps "$_up" || die 2 "invalid up_kbps: '$_up' (0..$MAX_KBPS)"
+	_lbl=$(sanitize_label "$_lbl")
+	[ "$(label_length "$_lbl")" -le "$MAX_LABEL" ] ||
+		die 2 "label too long (max $MAX_LABEL characters)"
+
+	_existing=$(find_group_by_range "$_range") || _existing=''
+	if [ -n "$_existing" ]; then
+		_sec=$_existing
+	else
+		_sec="grp_$(range_token "$_range")"
+	fi
+
+	if [ -n "$_en" ]; then
+		_en=$(norm_bool "$_en") || die 2 "invalid enabled flag: '$_en' (expect 0 or 1)"
+	elif [ -n "$_existing" ]; then
+		_en=$(uci_get "$_sec.enabled")
+		[ -n "$_en" ] || _en=1
+	else
+		_en=1
+	fi
+
+	if ! "$UCI" -q set "$CONFIG.$_sec=group" >/dev/null 2>&1; then
+		die 3 "cannot create/update group section $CONFIG.$_sec"
+	fi
+	"$UCI" -q set "$CONFIG.$_sec.start=$_start" >/dev/null 2>&1 || die 3 "uci set start failed"
+	"$UCI" -q set "$CONFIG.$_sec.end=$_end" >/dev/null 2>&1 || die 3 "uci set end failed"
+	"$UCI" -q set "$CONFIG.$_sec.range=$_range" >/dev/null 2>&1 || die 3 "uci set range failed"
+	"$UCI" -q delete "$CONFIG.$_sec.cidr" >/dev/null 2>&1
+	"$UCI" -q set "$CONFIG.$_sec.down_kbps=$_dn" >/dev/null 2>&1 || die 3 "uci set down_kbps failed"
+	"$UCI" -q set "$CONFIG.$_sec.up_kbps=$_up" >/dev/null 2>&1 || die 3 "uci set up_kbps failed"
+	"$UCI" -q set "$CONFIG.$_sec.label=$_lbl" >/dev/null 2>&1 || die 3 "uci set label failed"
+	"$UCI" -q set "$CONFIG.$_sec.enabled=$_en" >/dev/null 2>&1 || die 3 "uci set enabled failed"
+
+	uci_commit_or_die
+	apply_offload_then_render
+	return 0
+}
+
+cmd_group_delete() {
+	[ $# -eq 1 ] || die 1 "usage: hlimit-ctl group-delete <range|cidr>"
+	_sec=$(find_group_by_range "$1") || _sec=''
+	if [ -z "$_sec" ]; then
+		err "group not found: $1 (nothing to do)"
+		return 0
+	fi
+	"$UCI" -q delete "$CONFIG.$_sec" >/dev/null 2>&1 || die 3 "uci delete $CONFIG.$_sec failed"
+	uci_commit_or_die
+	apply_offload_then_render
+	return 0
+}
+
+cmd_group_toggle() {
+	[ $# -eq 2 ] || die 1 "usage: hlimit-ctl group-toggle <range|cidr> <0|1>"
+	case "$2" in 0|1) ;; *) die 2 "invalid enabled flag: '$2' (expect 0 or 1)" ;; esac
+	_sec=$(find_group_by_range "$1") || _sec=''
+	[ -n "$_sec" ] || die 2 "group not found: $1"
+	"$UCI" -q set "$CONFIG.$_sec.enabled=$2" >/dev/null 2>&1 || die 3 "uci set enabled failed"
+	uci_commit_or_die
+	apply_offload_then_render
+	return 0
+}
+
+cmd_set_default() {
+	[ $# -ge 3 ] || die 1 "usage: hlimit-ctl set-default <0|1> <down_kbps> <up_kbps> [cidr-ignored]"
+	[ $# -le 4 ] || die 1 "usage: hlimit-ctl set-default <0|1> <down_kbps> <up_kbps> [cidr-ignored]"
+	_en=$(norm_bool "$1") || die 2 "invalid enabled flag: '$1' (expect 0 or 1)"
+	_dn=$2
+	_up=$3
+	valid_kbps "$_dn" || die 2 "invalid down_kbps: '$_dn' (0..$MAX_KBPS)"
+	valid_kbps "$_up" || die 2 "invalid up_kbps: '$_up' (0..$MAX_KBPS)"
+
+	ensure_defaults_section
+	# v1.2: the default limit automatically covers all LAN interfaces, a
+	# stored CIDR is obsolete.  A 4th argument is accepted for v1.1 callers
+	# and ignored; the stale option is removed.
+	"$UCI" -q delete "$CONFIG.defaults.default_cidr" >/dev/null 2>&1
+
+	"$UCI" -q set "$CONFIG.defaults.default_enabled=$_en" >/dev/null 2>&1 || die 3 "uci set default_enabled failed"
+	"$UCI" -q set "$CONFIG.defaults.default_down_kbps=$_dn" >/dev/null 2>&1 || die 3 "uci set default_down_kbps failed"
+	"$UCI" -q set "$CONFIG.defaults.default_up_kbps=$_up" >/dev/null 2>&1 || die 3 "uci set default_up_kbps failed"
+
+	uci_commit_or_die
+	apply_offload_then_render
+	return 0
+}
+
+cmd_exclude_add() {
+	# deprecated in v1.2: whitelists are per group now
+	err "exclude-add is deprecated, use: group-exclude-add <range|cidr> <ip|mac>"
+	return 2
+}
+
+cmd_exclude_del() {
+	err "exclude-del is deprecated, use: group-exclude-del <range|cidr> <ip|mac>"
+	return 2
+}
+
+cmd_group_exclude_add() {
+	[ $# -eq 2 ] || die 1 "usage: hlimit-ctl group-exclude-add <range|cidr> <ip|mac|range>"
+	_sec=$(find_group_by_range "$1") || _sec=''
+	[ -n "$_sec" ] || die 2 "group not found: $1"
+	_range=$(group_range "$_sec") || die 2 "group has no valid IP range: $1"
+
+	if valid_ipv4 "$2"; then
+		ip_in_range "$2" "$_range" || die 2 "IP $2 is not inside $_range"
+		_val=$2
+	elif valid_mac "$2"; then
+		_val=$(norm_mac "$2")
+	else
+		_val=$(normalize_range "$2") ||
+			die 2 "invalid IP / MAC / range: '$2'"
+		range_within "$_val" "$_range" || die 2 "range $2 is not inside $_range"
+	fi
+
+	for _ex in $(uci_get "$_sec.exclude"); do
+		[ "$_ex" = "$_val" ] && return 0
+	done
+
+	"$UCI" -q add_list "$CONFIG.$_sec.exclude=$_val" >/dev/null 2>&1 ||
+		die 3 "uci add_list exclude failed"
+	uci_commit_or_die
+	apply_offload_then_render
+	return 0
+}
+
+cmd_group_exclude_del() {
+	[ $# -eq 2 ] || die 1 "usage: hlimit-ctl group-exclude-del <range|cidr> <ip|mac|range>"
+	_sec=$(find_group_by_range "$1") || _sec=''
+	[ -n "$_sec" ] || die 2 "group not found: $1"
+	_range=$(group_range "$_sec") || die 2 "group has no valid IP range: $1"
+
+	if valid_ipv4 "$2"; then
+		_val=$2
+	elif valid_mac "$2"; then
+		_val=$(norm_mac "$2")
+	else
+		_val=$(normalize_range "$2") || die 2 "invalid IP / MAC / range: '$2'"
+	fi
+
+	_stored=''
+	for _ex in $(uci_get "$_sec.exclude"); do
+		[ "$_ex" = "$_val" ] && { _stored=$_ex; break; }
+		_exn=''
+		if valid_ipv4 "$_ex"; then
+			_exn=$_ex
+		elif valid_mac "$_ex"; then
+			_exn=$(norm_mac "$_ex")
+		else
+			_exn=$(normalize_range "$_ex" 2>/dev/null || true)
+		fi
+		[ -n "$_exn" ] && [ "$_exn" = "$_val" ] && { _stored=$_ex; break; }
+	done
+	if [ -z "$_stored" ]; then
+		err "not in the group whitelist: $2 (nothing to do)"
+		return 0
+	fi
+
+	"$UCI" -q del_list "$CONFIG.$_sec.exclude=$_stored" >/dev/null 2>&1 ||
+		die 3 "uci del_list exclude failed"
+	uci_commit_or_die
+	apply_offload_then_render
+	return 0
+}
+
+cmd_apply() {
+	# used by the LuCI page after it saved the UCI configuration itself.
+	# `uci commit` is idempotent here; migration failures never block rules.
+	"$UCI" -q commit "$CONFIG" >/dev/null 2>&1 || die 3 "uci commit $CONFIG failed"
+	cmd_migrate >/dev/null 2>&1 || true
+	cmd_offload_apply || die 3 "offload handling failed (see above)"
+	cmd_render || die 3 "applying iptables rules failed (see above)"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# scan: LAN subnets, DHCP pool, discovered hosts, IP range candidates
+# ---------------------------------------------------------------------------
+
+_cand_json=''
+_cand_count=0
+
+cand_add() {
+	# cand_add <range> <start> <end> <hosts> <label>
+	[ "$_cand_count" -lt 30 ] || return 0
+	_o=$(printf '{"range":"%s","start":"%s","end":"%s","first":"%s","last":"%s","hosts":"%s","label":"%s"}' \
+		"$(json_escape "$1")" "$(json_escape "$2")" "$(json_escape "$3")" \
+		"$(json_escape "$2")" "$(json_escape "$3")" \
+		"$(json_escape "$4")" "$(json_escape "$5")")
+	if [ -n "$_cand_json" ]; then
+		_cand_json="$_cand_json,$_o"
+	else
+		_cand_json=$_o
+	fi
+	_cand_count=$((_cand_count + 1))
+}
+
+cmd_scan() {
+	refresh_lan_scope
+
+	# DHCP pool (start/end)
+	_pool=$(lan_pool)
+	_pstart=${_pool%% *}
+	_pend=${_pool#* }
+	[ "$_pool" = "$_pstart" ] && _pend=''
+
+	_hosts=$(lan_hosts)
+
+	# hosts JSON
+	_hosts_json=$(printf '%s\n' "$_hosts" | awk -F'|' '
+		function jesc(s,   out, i, c) {
+			out = ""
+			for (i = 1; i <= length(s); i++) {
+				c = substr(s, i, 1)
+				if (c == "\\")      out = out "\\\\"
+				else if (c == "\"") out = out "\\\""
+				else if (c == "\t") out = out "\\t"
+				else                out = out c
+			}
+			return out
+		}
+		BEGIN { n = 0 }
+		NF >= 5 {
+			n++
+			I[n] = $1; M[n] = $2; N[n] = $3; S[n] = $4; O[n] = $5
+		}
+		END {
+			printf "["
+			for (i = 1; i <= n; i++) {
+				if (i > 1) printf ","
+				printf "{\"ip\":\"%s\",\"mac\":\"%s\",\"name\":\"%s\",\"source\":\"%s\",\"online\":\"%s\"}",
+					jesc(I[i]), jesc(M[i]), jesc(N[i]), jesc(S[i]), jesc(O[i])
+			}
+			printf "]"
+		}')
+
+	# candidates: active /24 first (online host count desc), then whole LAN nets
+	_cand_json=''
+	_cand_count=0
+	_seen_cidrs=' '
+
+	_c24=''
+	if [ -n "$_hosts" ]; then
+		_c24=$(printf '%s\n' "$_hosts" | awk -F'|' '
+			$5 == "1" {
+				n = split($1, a, ".")
+				c = a[1] "." a[2] "." a[3] ".0/24"
+				if (!(c in seen)) { seen[c] = 1; order[++k] = c }
+				cnt[c]++
+			}
+			END { for (i = 1; i <= k; i++) print cnt[order[i]] " " order[i] }' |
+			sort -rn)
+	fi
+	if [ -n "$_c24" ]; then
+		while read -r _count _cidr; do
+			[ -n "$_cidr" ] || continue
+			_rng=$(normalize_range "$_cidr") || continue
+			case "$_seen_cidrs" in *" $_rng "*) continue ;; esac
+			_seen_cidrs="$_seen_cidrs$_rng "
+			_rs=${_rng%%-*}; _re=${_rng#*-}
+			cand_add "$_rng" "$_rs" "$_re" "$_count" \
+				"$_rs – $_re（$_count 台在线）"
+		done <<EOF
+$_c24
+EOF
+	fi
+
+	while IFS='|' read -r _net _dev _lip _mask _cidr; do
+		[ -n "$_cidr" ] || continue
+		_rng=$(normalize_range "$_cidr") || continue
+		case "$_seen_cidrs" in *" $_rng "*) continue ;; esac
+		_seen_cidrs="$_seen_cidrs$_rng "
+		_rs=${_rng%%-*}; _re=${_rng#*-}
+		cand_add "$_rng" "$_rs" "$_re" "" "全部局域网 $_rs – $_re"
+	done <<EOF
+$(lan_scope_cached)
+EOF
+
+	printf '{"lan":%s,"pool":{"start":"%s","end":"%s"},"hosts":%s,"candidates":[%s]}\n' \
+		"$(_lan_json)" "$(json_escape "$_pstart")" "$(json_escape "$_pend")" \
+		"$_hosts_json" "$_cand_json"
+}
+
+# ---------------------------------------------------------------------------
+# migrate: adapt v1.1 (or old subnet) configuration to the current LAN
+# ---------------------------------------------------------------------------
+
+MIG_ENTRIES=''
+MIG_NOTES=''
+
+mig_entry() {
+	# mig_entry <section> <from> <to> <mac>
+	_o=$(printf '{"section":"%s","from":"%s","to":"%s","mac":"%s"}' \
+		"$(json_escape "$1")" "$(json_escape "$2")" \
+		"$(json_escape "$3")" "$(json_escape "$4")")
+	if [ -n "$MIG_ENTRIES" ]; then
+		MIG_ENTRIES="$MIG_ENTRIES,$_o"
+	else
+		MIG_ENTRIES=$_o
+	fi
+}
+
+mig_note() {
+	_o=$(printf '"%s"' "$(json_escape "$1")")
+	if [ -n "$MIG_NOTES" ]; then
+		MIG_NOTES="$MIG_NOTES,$_o"
+	else
+		MIG_NOTES=$_o
+	fi
+}
+
+cmd_migrate() {
+	refresh_lan_scope
+	MIG_ENTRIES=''
+	MIG_NOTES=''
+	_changed=0
+	_claimed=' '
+
+	# 1. legacy defaults fields (the default limit now follows the LAN scope)
+	if [ -n "$(uci_get defaults.default_cidr)" ]; then
+		"$UCI" -q delete "$CONFIG.defaults.default_cidr" >/dev/null 2>&1
+		mig_note "removed default_cidr"
+		_changed=1
+	fi
+	if [ -n "$(uci_get defaults.default_exclude)" ]; then
+		"$UCI" -q delete "$CONFIG.defaults.default_exclude" >/dev/null 2>&1
+		mig_note "removed default_exclude"
+		_changed=1
+	fi
+
+	# 2. devices
+	for _sec in $(device_sections); do
+		_resline=$(device_resolution "$_sec")
+		_cip=${_resline%%|*}
+		_rest=${_resline#*|}
+		_mac=${_rest%%|*}
+		_lbl=$(sanitize_label "$(uci_get "$_sec.label")")
+
+		_want_ip=''
+		_want_mac=''
+		_reason=''
+
+		if [ -n "$_mac" ]; then
+			case "$_claimed" in
+			*" $_mac "*)
+				mig_note "duplicate mac $_mac on $_sec, kept as is"
+				_claimed="$_claimed$_mac "
+				continue
+				;;
+			esac
+			_resolved=$(resolve_mac "$_mac" 2>/dev/null || true)
+			if [ -n "$_resolved" ] && ip_in_lan "$_resolved"; then
+				_want_ip=$_resolved
+				_want_mac=$_mac
+			elif valid_ipv4 "$_cip" && ip_in_lan "$_cip"; then
+				# the stored IP is still valid; keep it
+				_want_ip=$_cip
+				_want_mac=$_mac
+			else
+				mig_note "stale: $_sec (mac $_mac not resolvable)"
+				_claimed="$_claimed$_mac "
+				continue
+			fi
+		else
+			# 2a. label / hostname match (case insensitive, must be unique)
+			_hit=''
+			if [ -n "$_lbl" ]; then
+				_hit=$(host_by_name "$_lbl" 2>/dev/null || true)
+			fi
+			if [ -n "$_hit" ]; then
+				_hmac=$(printf '%s' "$_hit" | cut -d'|' -f2)
+				_hip=$(printf '%s' "$_hit" | cut -d'|' -f1)
+				case "$_claimed" in
+				*" $_hmac "*) _hit='' ;;
+				*) _want_mac=$_hmac; _want_ip=$_hip; _reason=label ;;
+				esac
+			fi
+			if [ -z "$_want_mac" ]; then
+				if valid_ipv4 "$_cip" && ip_in_lan "$_cip"; then
+					# 2b. still a valid LAN IP: optionally learn the MAC
+					_hit2=$(host_by_ip "$_cip" 2>/dev/null || true)
+					_want_ip=$_cip
+					if [ -n "$_hit2" ]; then
+						_hmac=$(printf '%s' "$_hit2" | cut -d'|' -f2)
+						case "$_claimed" in
+						*" $_hmac "*) ;;
+						*) _want_mac=$_hmac; _reason=ip ;;
+						esac
+					fi
+				else
+					# 2c. legacy IP outside LAN: unique last-octet match
+					_hit3=''
+					if valid_ipv4 "$_cip"; then
+						_hit3=$(host_by_last_octet "$_cip" 2>/dev/null || true)
+					fi
+					if [ -n "$_hit3" ]; then
+						_hmac=$(printf '%s' "$_hit3" | cut -d'|' -f2)
+						_hip=$(printf '%s' "$_hit3" | cut -d'|' -f1)
+						case "$_claimed" in
+						*" $_hmac "*) _hit3='' ;;
+						*) _want_mac=$_hmac; _want_ip=$_hip; _reason=last-octet ;;
+						esac
+					fi
+					if [ -z "$_hit3" ]; then
+						mig_note "stale: $_sec ($_cip)"
+						continue
+					fi
+				fi
+			fi
+		fi
+
+		_set_ip=0
+		_set_mac=0
+		if [ -n "$_want_ip" ] && [ "$_want_ip" != "$_cip" ]; then
+			"$UCI" -q set "$CONFIG.$_sec.ip=$_want_ip" >/dev/null 2>&1 || die 3 "uci set ip failed"
+			_set_ip=1
+		fi
+		if [ -n "$_want_mac" ] && [ "$_want_mac" != "$_mac" ]; then
+			"$UCI" -q set "$CONFIG.$_sec.mac=$_want_mac" >/dev/null 2>&1 || die 3 "uci set mac failed"
+			_set_mac=1
+		fi
+		[ -n "$_want_mac" ] && _claimed="$_claimed$_want_mac "
+
+		if [ "$_set_ip" = 1 ] || [ "$_set_mac" = 1 ]; then
+			_changed=1
+			_from=$_cip
+			_to=$_cip
+			[ -n "$_want_ip" ] && _to=$_want_ip
+			_final_mac=$_mac
+			[ -n "$_want_mac" ] && _final_mac=$_want_mac
+			mig_entry "$_sec" "$_from" "$_to" "$_final_mac"
+		fi
+	done
+
+	# 3. groups: v1.3 stores an arbitrary IP range (start/end); convert old CIDRs
+	for _sec in $(group_sections); do
+		_gr_s=$(uci_get "$_sec.start")
+		_gr_e=$(uci_get "$_sec.end")
+		_gr_c=$(uci_get "$_sec.cidr")
+		_gr_r=$(uci_get "$_sec.range")
+		_range=''
+		if valid_ipv4 "$_gr_s" && valid_ipv4 "$_gr_e"; then
+			_range=$(normalize_range "$_gr_s-$_gr_e" 2>/dev/null || true)
+		elif [ -n "$_gr_r" ]; then
+			_range=$(normalize_range "$_gr_r" 2>/dev/null || true)
+		elif [ -n "$_gr_c" ]; then
+			_range=$(normalize_range "$_gr_c" 2>/dev/null || true)
+		fi
+		if [ -z "$_range" ]; then
+			mig_note "invalid group $_sec (bad range/cidr)"
+			continue
+		fi
+		_gs=${_range%%-*}
+		_ge=${_range#*-}
+		if [ "$_gr_s" != "$_gs" ] || [ "$_gr_e" != "$_ge" ]; then
+			"$UCI" -q set "$CONFIG.$_sec.start=$_gs" >/dev/null 2>&1 || die 3 "uci set start failed"
+			"$UCI" -q set "$CONFIG.$_sec.end=$_ge" >/dev/null 2>&1 || die 3 "uci set end failed"
+			_changed=1
+		fi
+		if [ "$_gr_r" != "$_range" ]; then
+			"$UCI" -q set "$CONFIG.$_sec.range=$_range" >/dev/null 2>&1 || die 3 "uci set range failed"
+			_changed=1
+		fi
+		if [ -n "$_gr_c" ]; then
+			"$UCI" -q delete "$CONFIG.$_sec.cidr" >/dev/null 2>&1
+			_changed=1
+			mig_note "converted group $_gr_c -> $_range"
+		fi
+		if [ -z "$(lan_devs_for_range "$_range")" ]; then
+			mig_note "group $_range is outside the current LAN"
+		fi
+	done
+
+	if [ "$_changed" = 1 ]; then
+		"$UCI" -q commit "$CONFIG" >/dev/null 2>&1 || die 3 "uci commit $CONFIG failed"
+	fi
+
+	printf '{"ok":"1","migrated":[%s],"notes":[%s]}\n' "$MIG_ENTRIES" "$MIG_NOTES"
+	return 0
+}
+# ---------------------------------------------------------------------------
+# firewall.user hook
+# ---------------------------------------------------------------------------
+
+remove_hook_block() {
+	[ -f "$FW_USER" ] || return 0
+
+	_tmp=$(mktemp "${FW_USER}.XXXXXX" 2>/dev/null) || _tmp="${FW_USER}.hlimit.$$"
+	awk -v b="$HOOK_BEGIN" -v e="$HOOK_END" -v l="$HOOK_LINE" '
+		$0 == b { skip = 1; next }
+		skip && $0 == e { skip = 0; next }
+		skip { next }
+		$0 == l { next }
+		$0 ~ /^\[ -x \/usr\/sbin\/hlimit-ctl \] && .*hlimit-ctl render/ { next }
+		{ print }
+	' "$FW_USER" >"$_tmp" || { rm -f "$_tmp"; return 1; }
+
+	# keep the original inode/permissions instead of mv'ing the temp file
+	if ! cat "$_tmp" >"$FW_USER"; then
+		rm -f "$_tmp"
+		return 1
+	fi
+	rm -f "$_tmp"
+	return 0
+}
+
+cmd_install_hook() {
+	_dir=$(dirname "$FW_USER")
+	[ -d "$_dir" ] || mkdir -p "$_dir"
+	[ -f "$FW_USER" ] || : >"$FW_USER" || die 3 "cannot create $FW_USER"
+
+	# already installed (and intact)? nothing to do
+	if grep -qxF "$HOOK_BEGIN" "$FW_USER" 2>/dev/null &&
+		grep -qxF "$HOOK_LINE" "$FW_USER" 2>/dev/null &&
+		grep -qxF "$HOOK_END" "$FW_USER" 2>/dev/null; then
+		return 0
+	fi
+
+	# first modification: keep a backup of the pristine file
+	if [ ! -f "$FW_BACKUP" ]; then
+		cp -p "$FW_USER" "$FW_BACKUP" 2>/dev/null || cp "$FW_USER" "$FW_BACKUP" 2>/dev/null
+	fi
+
+	remove_hook_block || die 3 "cannot rewrite $FW_USER"
+
+	{
+		printf '%s\n' "$HOOK_BEGIN"
+		printf '%s\n' "$HOOK_LINE"
+		printf '%s\n' "$HOOK_END"
+	} >>"$FW_USER" || die 3 "cannot append hook to $FW_USER"
+
+	return 0
+}
+
+cmd_remove_hook() {
+	[ -f "$FW_USER" ] || return 0
+	remove_hook_block || die 3 "cannot rewrite $FW_USER"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+usage() {
+	cat >&2 <<'EOF'
+Usage: hlimit-ctl <command> [args]
+
+Commands:
+  render                                     rebuild mangle chains + PREROUTING/POSTROUTING jumps
+  flush                                      remove chains + all jumps (mangle and v1 filter)
+  list                                       one-line JSON with rules/counters/defaults
+  status                                     like list, plus offload state
+  default-status                             default-limit configuration as JSON
+  devices                                    LAN hosts (static + leases + reachable ARP) as JSON
+  scan                                       LAN subnets + DHCP pool + hosts + range candidates
+  migrate                                    adapt old (v1.1 / other subnet) config to this LAN
+  global <0|1>                               enable/disable the whole service
+  set <ip|-> <down_kbps> <up_kbps> [label] [enabled] [mac]
+  delete <ip|mac>
+  toggle <ip|mac> <0|1>
+  group-set <start> <end> <down_kbps> <up_kbps> [label] [enabled]
+  group-set <range|cidr> <down_kbps> <up_kbps> [label] [enabled]   (compat)
+  group-delete <range|cidr>
+  group-toggle <range|cidr> <0|1>
+  group-exclude-add <range|cidr> <ip|mac|range>   per-group unlimited list
+  group-exclude-del <range|cidr> <ip|mac|range>
+  set-default <0|1> <down_kbps> <up_kbps>    covers every LAN interface (no CIDR
+                                             argument is needed; a v1.1 4th
+                                             argument is accepted and ignored)
+  exclude-add <ip|cidr>                      DEPRECATED (v1.2: per-group whitelist)
+  exclude-del <ip|cidr>                      DEPRECATED (v1.2: per-group whitelist)
+  apply                                      commit + migrate + offload + render (LuCI apply)
+  offload-apply                              disable FLOWOFFLOAD while limiting
+  offload-restore                            restore saved FLOWOFFLOAD settings
+  offload-status                             offload state as one-line JSON
+  install-hook                               add /etc/firewall.user hook
+  remove-hook                                remove /etc/firewall.user hook
+EOF
+}
+
+cmd=${1-}
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+render) cmd_render ;;
+flush) cmd_flush ;;
+list) cmd_list ;;
+status) cmd_status ;;
+default-status) cmd_default_status ;;
+devices) cmd_devices ;;
+scan) cmd_scan ;;
+migrate) cmd_migrate ;;
+global) cmd_global "$@" ;;
+set) cmd_set "$@" ;;
+delete) cmd_delete "$@" ;;
+toggle) cmd_toggle "$@" ;;
+group-set) cmd_group_set "$@" ;;
+group-delete) cmd_group_delete "$@" ;;
+group-toggle) cmd_group_toggle "$@" ;;
+group-exclude-add) cmd_group_exclude_add "$@" ;;
+group-exclude-del) cmd_group_exclude_del "$@" ;;
+set-default) cmd_set_default "$@" ;;
+exclude-add) cmd_exclude_add "$@" ;;
+exclude-del) cmd_exclude_del "$@" ;;
+apply) cmd_apply ;;
+offload-apply) cmd_offload_apply ;;
+offload-restore) cmd_offload_restore ;;
+offload-status) cmd_offload_status ;;
+install-hook) cmd_install_hook ;;
+remove-hook) cmd_remove_hook ;;
+help|-h|--help) usage ;;
+*) usage; exit 1 ;;
+esac
