@@ -1,9 +1,9 @@
-# /etc/config/hashlimit-qos - luci-app-hlimit 1.2.0 configuration
+# /etc/config/hashlimit-qos - luci-app-hlimit 1.3.x configuration
 #
 # UCI section types:
 #   defaults  (one)    global switch + default (catch-all) limit
 #   device    (many)   one individually throttled client (highest priority)
-#   group     (many)   one throttled CIDR (batch, middle priority)
+#   group     (many)   one throttled IP range (batch, middle priority)
 #
 # v1.2: the LAN scope is detected at runtime (firewall zone name=lan ->
 # network devices -> their IPv4 subnets).  The default limit automatically
@@ -33,12 +33,16 @@
 #   it still wins over a group and over the default limit (exemption).
 #
 # group options:
-#   cidr        one CIDR inside a LAN subnet, e.g. 10.0.0.96/28
+#   start       first address of the range (canonical, written by the LuCI page)
+#   end         last address of the range; start/end may cross subnet borders
+#   range       "start-end", derived/kept in sync by hlimit-ctl (compat field)
+#   cidr        legacy 1.2/1.3.0 field, still read and converted by `migrate`
 #   label       free-form name shown in LuCI
 #   enabled     1 = apply this group, 0 = ignore
 #   down_kbps   download limit in kbit/s, 0 = unlimited
 #   up_kbps     upload limit in kbit/s, 0 = unlimited
-#   exclude     list of IPs or MACs that are not limited by THIS group only
+#   exclude     per-group whitelist: IPs, MACs or sub-ranges not limited by
+#               THIS group only (rendered as RETURN before the limit rules)
 #
 # Priority: device > per-group exclude > group > default limit.
 # Values are written by the LuCI page through /usr/sbin/hlimit-ctl, do not edit
@@ -54,7 +58,8 @@ config defaults 'defaults'
 	option default_up_kbps '0'
 
 # Example device (the LuCI page creates these sections automatically).
-# Any private IPv4 prefix works - the examples show both a /8 and a /24 LAN:
+# Any private IPv4 prefix works - the examples show both a /8 and a /24 LAN.
+# MAC addresses / labels below are placeholders:
 #config device 'dev_10_0_0_162'
 #	option ip '10.0.0.162'
 #	option mac 'aa:bb:cc:dd:ee:01'
@@ -73,9 +78,11 @@ config defaults 'defaults'
 #	option up_kbps '1024'
 #	option mode 'auto'
 
-# Example batch group with a per-group unlimited list:
-#config group 'grp_10_0_0_96_28'
-#	option cidr '10.0.0.96/28'
+# Example batch group with a per-group whitelist:
+#config group 'grp_10_0_0_96_10_0_0_111'
+#	option start '10.0.0.96'
+#	option end '10.0.0.111'
+#	option range '10.0.0.96-10.0.0.111'
 #	option label '访客网段'
 #	option enabled '1'
 #	option down_kbps '10000'
@@ -83,8 +90,10 @@ config defaults 'defaults'
 #	list exclude '10.0.0.110'
 #	list exclude 'aa:bb:cc:dd:ee:01'
 #
-#config group 'grp_192_168_2_96_28'
-#	option cidr '192.168.2.96/28'
+#config group 'grp_192_168_2_96_192_168_2_111'
+#	option start '192.168.2.96'
+#	option end '192.168.2.111'
+#	option range '192.168.2.96-192.168.2.111'
 #	option label '访客网段'
 #	option enabled '1'
 #	option down_kbps '10000'
